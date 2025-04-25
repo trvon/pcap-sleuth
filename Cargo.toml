@@ -1,7 +1,7 @@
 [package]
 name = "pcap-sleuth"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 pcap = "1.2"
