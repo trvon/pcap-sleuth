@@ -26,26 +26,43 @@ fn test_parse_suricata_alerts() {
 
     // Print alert details for debugging
     for (i, alert) in alerts.iter().enumerate() {
-        println!("Alert {}: proto={:?}, signature={}", i, alert.proto, alert.signature);
+        println!(
+            "Alert {}: proto={:?}, signature={}",
+            i, alert.proto, alert.signature
+        );
     }
 
     // Check protocol values without relying on specific indexes
     // Get all protocols from the alerts
-    let protocol_counts: HashMap<_, _> = alerts.iter()
-        .filter_map(|a| a.proto)
-        .fold(HashMap::new(), |mut map, proto| {
-            *map.entry(proto).or_insert(0) += 1;
-            map
-        });
-    
+    let protocol_counts: HashMap<_, _> =
+        alerts
+            .iter()
+            .filter_map(|a| a.proto)
+            .fold(HashMap::new(), |mut map, proto| {
+                *map.entry(proto).or_insert(0) += 1;
+                map
+            });
+
     // Check that we have the expected number of each protocol
     println!("Protocol counts: {:?}", protocol_counts);
     // We should have 4 TCP alerts (proto=6)
-    assert_eq!(protocol_counts.get(&6).unwrap_or(&0), &4, "Expected 4 TCP alerts");
+    assert_eq!(
+        protocol_counts.get(&6).unwrap_or(&0),
+        &4,
+        "Expected 4 TCP alerts"
+    );
     // We should have 1 UDP alert (proto=17)
-    assert_eq!(protocol_counts.get(&17).unwrap_or(&0), &1, "Expected 1 UDP alert");
+    assert_eq!(
+        protocol_counts.get(&17).unwrap_or(&0),
+        &1,
+        "Expected 1 UDP alert"
+    );
     // We should have 1 ICMP alert (proto=1)
-    assert_eq!(protocol_counts.get(&1).unwrap_or(&0), &1, "Expected 1 ICMP alert");
+    assert_eq!(
+        protocol_counts.get(&1).unwrap_or(&0),
+        &1,
+        "Expected 1 ICMP alert"
+    );
 
     // Check specific alert attributes
     let first_alert = &alerts[0];
@@ -94,11 +111,17 @@ fn test_correlate_alerts_with_flows() {
         !flow.suricata_alerts.is_empty(),
         "Flow should have an alert attached"
     );
-    assert_eq!(flow.suricata_alerts[0].signature, "ET SCAN Potential SSH Scan");
+    assert_eq!(
+        flow.suricata_alerts[0].signature,
+        "ET SCAN Potential SSH Scan"
+    );
 
     // Check if attack label was set
     assert!(flow.attack_type.is_some());
-    assert_eq!(flow.attack_type.as_ref().unwrap(), "ET SCAN Potential SSH Scan");
+    assert_eq!(
+        flow.attack_type.as_ref().unwrap(),
+        "ET SCAN Potential SSH Scan"
+    );
 }
 
 #[test]

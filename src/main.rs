@@ -6,7 +6,6 @@ use env_logger::Env;
 use ipnetwork::IpNetwork;
 use log::{debug, info, warn};
 use pcap::{Capture, PacketHeader};
-use pnet::packet::Packet;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::icmp::{IcmpPacket, IcmpType};
 use pnet::packet::icmpv6::{Icmpv6Packet, Icmpv6Type};
@@ -15,20 +14,21 @@ use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
 use pnet::packet::tcp::TcpPacket;
 use pnet::packet::udp::UdpPacket;
+use pnet::packet::Packet;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::fs::{self, File, create_dir_all};
+use std::fs::{self, create_dir_all, File};
 use std::io::{BufRead, BufReader, Read};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{
-    Mutex,
     atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    Mutex,
 };
 
 #[derive(Parser, Debug)]
@@ -1018,12 +1018,9 @@ fn run_attack_detection(
 
     // First pass: gather statistics per source IP
     for pkt in packets {
-        if let (Some(src_ip), Some(dst_ip), Some(dst_port), Some(protocol)) = (
-            pkt.src_ip,
-            pkt.dst_ip,
-            pkt.dst_port,
-            pkt.protocol,
-        ) {
+        if let (Some(src_ip), Some(dst_ip), Some(dst_port), Some(protocol)) =
+            (pkt.src_ip, pkt.dst_ip, pkt.dst_port, pkt.protocol)
+        {
             let stats = source_stats.entry(src_ip).or_default();
             stats.packet_count += 1;
             stats.dst_ips.insert(dst_ip);
@@ -1425,7 +1422,7 @@ pub fn correlate_alerts_with_flows(
         enabled: true,
         alert_format: "{signature}".to_string(),
     };
-    
+
     correlate_suricata_alerts(flows, alerts, &default_config)
 }
 
@@ -1480,13 +1477,12 @@ pub fn parse_suricata_alerts(path: &Path) -> Result<Vec<SuricataAlert>, Box<dyn 
                 // Optional port and protocol information
                 let src_port = json_value["src_port"].as_u64().map(|p| p as u16);
                 let dst_port = json_value["dest_port"].as_u64().map(|p| p as u16);
-                let proto = json_value["proto"].as_str()
-                    .map(|p| match p {
-                        "TCP" | "tcp" => 6,
-                        "UDP" | "udp" => 17,
-                        "ICMP" | "icmp" => 1,
-                        _ => 0,
-                    });
+                let proto = json_value["proto"].as_str().map(|p| match p {
+                    "TCP" | "tcp" => 6,
+                    "UDP" | "udp" => 17,
+                    "ICMP" | "icmp" => 1,
+                    _ => 0,
+                });
 
                 // Add to shared alerts vector with mutex
                 if let Ok(mut alert_vec) = alerts.lock() {
@@ -1533,7 +1529,7 @@ pub fn correlate_suricata_alerts(
     for alert in alerts {
         let key = (alert.src_ip, alert.dst_ip);
         alerts_by_ip.entry(key).or_default().push(alert);
-        
+
         // Also add reverse direction for bidirectional matching
         let rev_key = (alert.dst_ip, alert.src_ip);
         alerts_by_ip.entry(rev_key).or_default().push(alert);
@@ -1545,7 +1541,7 @@ pub fn correlate_suricata_alerts(
 
     // First, find all matches in parallel without modifying flows
     let flow_keys: Vec<FlowKey> = flows.keys().cloned().collect();
-    
+
     flow_keys.par_iter().for_each(|key| {
         // Check if we have any alerts for this IP pair
         if let Some(relevant_alerts) = alerts_by_ip.get(&(key.ip_a, key.ip_b)) {
@@ -1586,7 +1582,7 @@ pub fn correlate_suricata_alerts(
                         .replace("{alert_category}", &alert.category)
                         .replace("{severity}", &alert.severity.to_string())
                         .replace("{signature_id}", &alert.signature_id.to_string());
-                    
+
                     // Add to collection of matches in a thread-safe way
                     if let Ok(mut matches) = matches_to_apply.lock() {
                         matches.push((key.clone(), (*alert).clone(), alert_str));
@@ -1602,7 +1598,7 @@ pub fn correlate_suricata_alerts(
         for (key, alert, alert_str) in collected_matches {
             if let Some(flow_data) = flows.get_mut(&key) {
                 flow_data.suricata_alerts.push(alert);
-                
+
                 // If no other attack type is set, label this flow
                 if flow_data.attack_type.is_none() {
                     flow_data.attack_type = Some(alert_str);
