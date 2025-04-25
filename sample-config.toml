@@ -1,0 +1,69 @@
+# pcap-sleuth sample configuration file
+
+[detection]
+# Global detection enablement (can be overridden with --detect-attacks CLI flag)
+enabled = true
+
+# Settings for different detection heuristics
+[detection.heuristics]
+
+# TCP SYN scan detection settings
+[detection.heuristics.syn_scan]
+enabled = true
+threshold = 20  # Number of distinct ports accessed to trigger detection
+
+# TCP Connect scan detection settings
+[detection.heuristics.connect_scan]
+enabled = true
+threshold = 20  # Number of distinct ports with established connections
+
+# UDP scan detection settings
+[detection.heuristics.udp_scan]
+enabled = true
+threshold = 15  # Lower threshold for UDP scans as they're often more targeted
+
+# SYN flood detection settings
+[detection.heuristics.syn_flood]
+enabled = true
+rate_threshold = 100  # Number of SYN packets per time window to trigger detection
+time_window_secs = 1  # Time window size in seconds for rate calculation
+
+# Port sweep detection settings
+[detection.heuristics.port_sweep]
+enabled = true
+threshold = 10  # Number of distinct destination IPs accessed on the same port
+
+# Ping sweep detection settings
+[detection.heuristics.ping_sweep]
+enabled = true
+threshold = 5  # Number of distinct destination IPs pinged to trigger detection
+
+# Label generation settings
+[detection.labels]
+# Format string for attack labels
+# Available placeholders: {type} - the detected attack type
+attack_format = "attack:{type}"
+
+# Suricata integration settings
+[suricata]
+# Enable Suricata alert integration (can be overridden with --suricata-alerts CLI flag)
+enabled = true
+
+# Format string for Suricata alert labels
+# Available placeholders:
+#   {signature} - Alert signature name
+#   {alert_category} - Alert category
+#   {severity} - Alert severity (1-4, with 1 being highest)
+#   {signature_id} - Alert signature ID
+alert_format = "suricata:{alert_category}:{signature}"
+
+# Flow timeout and management settings
+[flow]
+# TCP flow timeout in seconds (default: 300 seconds = 5 minutes)
+tcp_timeout_secs = 300
+
+# UDP flow timeout in seconds (default: 180 seconds = 3 minutes)
+udp_timeout_secs = 180
+
+# Flow timeout check interval - check for timeouts every N packets (default: 1000)
+check_interval = 1000
