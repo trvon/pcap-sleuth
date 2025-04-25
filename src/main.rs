@@ -6,6 +6,7 @@ use env_logger::Env;
 use ipnetwork::IpNetwork;
 use log::{debug, info, warn};
 use pcap::{Capture, PacketHeader};
+use pnet::packet::Packet;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
 use pnet::packet::icmp::{IcmpPacket, IcmpType};
 use pnet::packet::icmpv6::{Icmpv6Packet, Icmpv6Type};
@@ -14,21 +15,20 @@ use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
 use pnet::packet::tcp::TcpPacket;
 use pnet::packet::udp::UdpPacket;
-use pnet::packet::Packet;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::fs::{self, create_dir_all, File};
+use std::fs::{self, File, create_dir_all};
 use std::io::{BufRead, BufReader, Read};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering as AtomicOrdering},
     Mutex,
+    atomic::{AtomicUsize, Ordering as AtomicOrdering},
 };
 
 #[derive(Parser, Debug)]
