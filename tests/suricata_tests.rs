@@ -131,30 +131,30 @@ fn test_correlate_alerts_with_flows() {
 //     {"timestamp":"2023-05-01T12:00:01.123456+0000","flow_id":12345,"event_type":"alert","src_ip":"192.168.1.100","dest_ip":"192.168.1.20","proto":"TCP"}
 //     {"timestamp":"2023-05-01T12:00:02.456789+0000","flow_id":12346,"event_type":"alert","src_ip":"192.168.1.100","src_port":45232,"dest_port":22,"proto":"TCP","alert":{"signature":"ET SCAN Minimal"}}
 //     "#;
-// 
+//
 //     // Write this JSON to a temporary file
 //     let temp_path = Path::new("tests/data/minimal_eve.json");
 //     std::fs::write(temp_path, sample_json).expect("Failed to write temporary file");
-// 
+//
 //     // Attempt to parse it
 //     let alerts = main::parse_suricata_alerts(&temp_path).expect("Failed to parse minimal alerts");
-// 
+//
 //     // We expect 2 alerts to be parsed, but with default values for missing fields
 //     assert_eq!(
 //         alerts.len(),
 //         2,
 //         "Expected 2 alerts even with missing fields"
 //     );
-// 
+//
 //     // First alert has no alert object in JSON, so it gets defaults for alert fields
 //     assert_eq!(alerts[0].signature, "Unknown");
 //     assert_eq!(alerts[0].signature_id, 0);
 //     assert_eq!(alerts[0].severity, 0);
-// 
+//
 //     // Second alert has signature in alert object, so it gets that value
 //     assert_eq!(alerts[1].signature, "ET SCAN Minimal");
 //     assert_eq!(alerts[1].signature_id, 0);
-// 
+//
 //     // Clean up
 //     std::fs::remove_file(temp_path).expect("Failed to remove temporary file");
 // }
