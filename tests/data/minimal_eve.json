@@ -1,0 +1,4 @@
+
+    {"timestamp":"2023-05-01T12:00:01.123456+0000","flow_id":12345,"event_type":"alert","src_ip":"192.168.1.100","dest_ip":"192.168.1.20","proto":"TCP"}
+    {"timestamp":"2023-05-01T12:00:02.456789+0000","flow_id":12346,"event_type":"alert","src_ip":"192.168.1.100","src_port":45232,"dest_port":22,"proto":"TCP","alert":{"signature":"ET SCAN Minimal"}}
+    

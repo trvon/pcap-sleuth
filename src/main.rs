@@ -5,11 +5,11 @@ use csv::ReaderBuilder;
 use env_logger::Env;
 use ipnetwork::IpNetwork;
 use log::{debug, info, warn};
-use pcap::{Capture, PacketHeader};
+use pcap::Capture;
 use pnet::packet::Packet;
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
-use pnet::packet::icmp::{IcmpPacket, IcmpType};
-use pnet::packet::icmpv6::{Icmpv6Packet, Icmpv6Type};
+use pnet::packet::icmp::IcmpPacket;
+use pnet::packet::icmpv6::Icmpv6Packet;
 use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::ipv6::Ipv6Packet;
@@ -215,7 +215,7 @@ struct FlowSummary {
 fn write_packet_csv(packets: &[PacketInfo], output_path: &Path) -> Result<(), Box<dyn Error>> {
     let file = File::create(output_path)?;
     let mut wtr = csv::Writer::from_writer(file);
-    wtr.write_record(&[
+    wtr.write_record([
         "timestamp",
         "src_ip",
         "dst_ip",
@@ -231,7 +231,7 @@ fn write_packet_csv(packets: &[PacketInfo], output_path: &Path) -> Result<(), Bo
         "label",
     ])?;
     for pkt in packets {
-        wtr.write_record(&[
+        wtr.write_record([
             &pkt.timestamp.to_rfc3339(),
             &pkt.src_ip.map_or("".to_string(), |ip| ip.to_string()),
             &pkt.dst_ip.map_or("".to_string(), |ip| ip.to_string()),
@@ -1327,7 +1327,7 @@ fn protocol_for_ip_pair(
     ip_b: IpAddr,
     flows: &HashMap<FlowKey, FlowData>,
 ) -> Option<u8> {
-    for (key, _) in flows {
+    for key in flows.keys() {
         if (key.ip_a == ip_a && key.ip_b == ip_b) || (key.ip_a == ip_b && key.ip_b == ip_a) {
             return Some(key.protocol);
         }
@@ -1341,7 +1341,7 @@ fn find_flow_id_for_scan(
     dst_ip: IpAddr,
     flows: &HashMap<FlowKey, FlowData>,
 ) -> Option<String> {
-    for (key, _) in flows {
+    for key in flows.keys() {
         // We want to find any flow between these two IPs to associate the scan with
         if (key.ip_a == src_ip && key.ip_b == dst_ip) || (key.ip_a == dst_ip && key.ip_b == src_ip)
         {
@@ -1358,7 +1358,7 @@ fn find_flow_id_for_service(
     dst_port: u16,
     flows: &HashMap<FlowKey, FlowData>,
 ) -> Option<String> {
-    for (key, _) in flows {
+    for key in flows.keys() {
         // Find flows to the specific destination service
         if (key.ip_a == src_ip && key.ip_b == dst_ip && key.port_b == dst_port)
             || (key.ip_b == src_ip && key.ip_a == dst_ip && key.port_a == dst_port)
