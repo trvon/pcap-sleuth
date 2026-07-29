@@ -41,7 +41,7 @@ fn test_basic_cli_functionality() {
     let output_files = fs::read_dir(output_dir).expect("Failed to read output directory");
     let has_csv = output_files
         .filter_map(Result::ok)
-        .any(|entry| entry.path().extension().map_or(false, |ext| ext == "csv"));
+        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "csv"));
 
     assert!(has_csv, "CSV output file not found");
 }
@@ -77,7 +77,7 @@ fn test_json_output() {
     let output_files = fs::read_dir(output_dir).expect("Failed to read output directory");
     let has_json = output_files
         .filter_map(Result::ok)
-        .any(|entry| entry.path().extension().map_or(false, |ext| ext == "json"));
+        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"));
 
     assert!(has_json, "JSON output file not found");
 

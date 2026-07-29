@@ -2,18 +2,14 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 
-// Import needed functionality from main crate
-// We need to use #[path] to include functions from main.rs
-#[path = "../src/main.rs"]
-mod main;
+use pcap_sleuth::{FlowData, FlowKey, correlate_alerts_with_flows, parse_suricata_alerts};
 
 #[test]
 fn test_parse_suricata_alerts() {
     let sample_path = Path::new("tests/data/sample_eve.json");
 
     // Test parsing of alerts
-    let alerts =
-        main::parse_suricata_alerts(&sample_path).expect("Failed to parse Suricata alerts");
+    let alerts = parse_suricata_alerts(sample_path).expect("Failed to parse Suricata alerts");
 
     // We should have 6 alerts (one entry is a flow, not an alert)
     assert_eq!(
@@ -80,7 +76,7 @@ fn test_correlate_alerts_with_flows() {
     let mut flows = HashMap::new();
 
     // Create flow key matching one of our sample alerts
-    let flow_key = main::FlowKey {
+    let flow_key = FlowKey {
         ip_a: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)),
         ip_b: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
         port_a: 45231,
@@ -89,20 +85,22 @@ fn test_correlate_alerts_with_flows() {
     };
 
     // Create minimal flow data
-    let mut flow_data = main::FlowData::default();
-    flow_data.start_time = chrono::Utc::now();
-    flow_data.end_time = chrono::Utc::now();
+    let now = chrono::Utc::now();
+    let flow_data = FlowData {
+        start_time: now,
+        end_time: now,
+        ..FlowData::default()
+    };
 
     // Add flow to map
     flows.insert(flow_key.clone(), flow_data);
 
     // Parse alerts from sample file
     let sample_path = Path::new("tests/data/sample_eve.json");
-    let alerts =
-        main::parse_suricata_alerts(&sample_path).expect("Failed to parse Suricata alerts");
+    let alerts = parse_suricata_alerts(sample_path).expect("Failed to parse Suricata alerts");
 
     // Run correlation
-    main::correlate_alerts_with_flows(&alerts, &mut flows);
+    correlate_alerts_with_flows(&alerts, &mut flows);
 
     // Check if our flow has an alert attached
     let flow = flows.get(&flow_key).expect("Flow should exist in map");
@@ -137,7 +135,7 @@ fn test_correlate_alerts_with_flows() {
 //     std::fs::write(temp_path, sample_json).expect("Failed to write temporary file");
 //
 //     // Attempt to parse it
-//     let alerts = main::parse_suricata_alerts(&temp_path).expect("Failed to parse minimal alerts");
+//     let alerts = parse_suricata_alerts(&temp_path).expect("Failed to parse minimal alerts");
 //
 //     // We expect 2 alerts to be parsed, but with default values for missing fields
 //     assert_eq!(
@@ -181,7 +179,7 @@ fn test_large_file_performance() {
 
     // Measure parsing time
     let start = Instant::now();
-    let alerts = main::parse_suricata_alerts(&large_path).expect("Failed to parse large file");
+    let alerts = parse_suricata_alerts(large_path).expect("Failed to parse large file");
     let duration = start.elapsed();
 
     // We should have 600 alerts (6 * 100)
