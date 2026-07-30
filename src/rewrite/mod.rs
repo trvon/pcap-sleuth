@@ -140,6 +140,7 @@ struct RewriteStats {
     packets_converted: u64,
     packets_remapped: u64,
     packets_ipv6_converted: u64,
+    capture_duration_seconds: Option<f64>,
     input_format: String,
     output_format: String,
     linktype_in: String,
@@ -607,9 +608,15 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
 
     if config.dry_run {
         let mut packets_total = 0_u64;
+        let mut first_timestamp: Option<f64> = None;
+        let mut last_timestamp: Option<f64> = None;
         let start = Instant::now();
-        while capture.next_packet().is_ok() {
+        while let Ok(packet) = capture.next_packet() {
             packets_total += 1;
+            let timestamp =
+                packet.header.ts.tv_sec as f64 + packet.header.ts.tv_usec as f64 / 1_000_000.0;
+            first_timestamp.get_or_insert(timestamp);
+            last_timestamp = Some(timestamp);
 
             if config.progress_every > 0 && packets_total % config.progress_every == 0 {
                 let elapsed = start.elapsed().as_secs_f64().max(0.001);
@@ -636,6 +643,9 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 packets_converted: 0,
                 packets_remapped: 0,
                 packets_ipv6_converted: 0,
+                capture_duration_seconds: first_timestamp
+                    .zip(last_timestamp)
+                    .map(|(first, last)| (last - first).max(0.0)),
                 input_format: input_format.clone(),
                 output_format: format!("dry-run ({:?})", input_linktype),
                 linktype_in: format!("{:?}", input_linktype),
@@ -671,6 +681,8 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
     let mut packets_converted = 0_u64;
     let mut packets_remapped = 0_u64;
     let mut packets_ipv6_converted = 0_u64;
+    let mut first_timestamp: Option<f64> = None;
+    let mut last_timestamp: Option<f64> = None;
     let mut warnings = Vec::new();
     let start = Instant::now();
 
@@ -678,6 +690,10 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
         match capture.next_packet() {
             Ok(packet) => {
                 packets_total += 1;
+                let timestamp =
+                    packet.header.ts.tv_sec as f64 + packet.header.ts.tv_usec as f64 / 1_000_000.0;
+                first_timestamp.get_or_insert(timestamp);
+                last_timestamp = Some(timestamp);
                 let mut data = packet.data.to_vec();
                 let mut header = *packet.header;
 
@@ -789,6 +805,9 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
             packets_converted,
             packets_remapped,
             packets_ipv6_converted,
+            capture_duration_seconds: first_timestamp
+                .zip(last_timestamp)
+                .map(|(first, last)| (last - first).max(0.0)),
             input_format: input_format.clone(),
             output_format: format!("pcap ({:?})", output_linktype),
             linktype_in: format!("{:?}", input_linktype),
@@ -948,6 +967,7 @@ mod tests {
         assert!(contents.contains("\"status\""));
         assert!(contents.contains("success"));
         assert!(contents.contains("packets_total"));
+        assert!(contents.contains("capture_duration_seconds"));
 
         Ok(())
     }
@@ -1042,6 +1062,7 @@ mod tests {
         let manifest_json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(manifest)?)?;
         assert_eq!(manifest_json["stats"]["packets_ipv6_converted"], 1);
+        assert_eq!(manifest_json["stats"]["capture_duration_seconds"], 0.0);
 
         Ok(())
     }
