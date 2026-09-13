@@ -134,12 +134,30 @@ impl RewriteManifest {
     }
 }
 
+/// Raise `len` to `caplen` when a record claims fewer bytes on the wire than
+/// were captured. Some corpus captures carry such records (e.g. caplen 606 >
+/// len 110), and gopherCap refuses the whole file on the first one after
+/// scanning all of it — 80 minutes for a 16 GB capture. The bytes present are
+/// the truth. Returns whether the header was changed.
+pub fn clamp_record_len(header: &mut pcap::PacketHeader) -> bool {
+    if header.len < header.caplen {
+        header.len = header.caplen;
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Debug, Serialize, Clone, Default)]
 struct RewriteStats {
     packets_total: u64,
     packets_converted: u64,
     packets_remapped: u64,
     packets_ipv6_converted: u64,
+    /// Records whose caplen exceeded len in the source; len was raised to
+    /// caplen so gopherCap (which rejects the whole file on the first such
+    /// record after scanning all of it) accepts the output.
+    packets_len_clamped: u64,
     capture_duration_seconds: Option<f64>,
     input_format: String,
     output_format: String,
@@ -643,6 +661,7 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 packets_converted: 0,
                 packets_remapped: 0,
                 packets_ipv6_converted: 0,
+                packets_len_clamped: 0,
                 capture_duration_seconds: first_timestamp
                     .zip(last_timestamp)
                     .map(|(first, last)| (last - first).max(0.0)),
@@ -681,6 +700,7 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
     let mut packets_converted = 0_u64;
     let mut packets_remapped = 0_u64;
     let mut packets_ipv6_converted = 0_u64;
+    let mut packets_len_clamped = 0_u64;
     let mut first_timestamp: Option<f64> = None;
     let mut last_timestamp: Option<f64> = None;
     let mut warnings = Vec::new();
@@ -746,6 +766,9 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                     }
                 }
 
+                if clamp_record_len(&mut header) {
+                    packets_len_clamped += 1;
+                }
                 let packet_for_write = pcap::Packet::new(&header, &data);
                 writer.write(&packet_for_write);
 
@@ -805,6 +828,7 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
             packets_converted,
             packets_remapped,
             packets_ipv6_converted,
+            packets_len_clamped,
             capture_duration_seconds: first_timestamp
                 .zip(last_timestamp)
                 .map(|(first, last)| (last - first).max(0.0)),
@@ -1009,6 +1033,42 @@ mod tests {
         assert_eq!(mapped_src.octets()[0], 10);
         assert_eq!(mapped_dst.octets()[0], 10);
 
+        Ok(())
+    }
+
+    #[test]
+    fn clamps_records_whose_caplen_exceeds_len() -> Result<(), Box<dyn Error>> {
+        // Some corpus captures carry records with caplen > len; gopherCap
+        // refuses the whole file on the first one. The rewriter must emit
+        // len >= caplen and count what it clamped.
+        let tmp = tempdir()?;
+        let input = tmp.path().join("badlen.pcap");
+        let mut data = minimal_pcap_with_packet()?;
+        // record header follows the 24-byte file header: ts_sec, ts_usec, caplen, len
+        let caplen = u32::from_le_bytes(data[32..36].try_into()?);
+        assert!(caplen > 1, "fixture must carry a packet");
+        let bogus_len = caplen - 1;
+        data[36..40].copy_from_slice(&bogus_len.to_le_bytes());
+        fs::write(&input, &data)?;
+        let manifest = tmp.path().join("manifest.json");
+        let cli = RewriteCli {
+            input: input.clone(),
+            output: None,
+            manifest: Some(manifest.clone()),
+            topology: None,
+            verbose: 0,
+            dry_run: false,
+            progress_every: 0,
+            max_packets: None,
+        };
+        run(cli)?;
+        let output = tmp.path().join("badlen_rewritten.pcap");
+        let mut out_cap = Capture::from_file(&output)?;
+        let packet = out_cap.next_packet().expect("one packet");
+        assert!(packet.header.len >= packet.header.caplen,
+                "len {} < caplen {}", packet.header.len, packet.header.caplen);
+        let manifest_json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&manifest)?)?;
+        assert_eq!(manifest_json["stats"]["packets_len_clamped"], 1);
         Ok(())
     }
 
