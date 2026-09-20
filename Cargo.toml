@@ -24,3 +24,8 @@ sha1 = "0.10"
 tempfile = "3.8"
 assert_cmd = "2.0"
 predicates = "3.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

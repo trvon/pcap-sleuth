@@ -9,8 +9,6 @@ use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
 use pnet::packet::ip::{IpNextHeaderProtocol, IpNextHeaderProtocols};
 use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet, checksum as ipv4_checksum};
 use pnet::packet::ipv6::Ipv6Packet;
-use pnet::packet::tcp::{MutableTcpPacket, ipv4_checksum as tcp_ipv4_checksum};
-use pnet::packet::udp::{MutableUdpPacket, ipv4_checksum as udp_ipv4_checksum};
 use serde::Serialize;
 use serde_json::Value;
 use sha1::{Digest, Sha1};
@@ -172,6 +170,228 @@ struct RewriteOutcome {
     warnings: Vec<String>,
 }
 
+/// Write buffer for the rewritten capture.
+///
+/// libpcap's `pcap_dump` issues two `fwrite` calls per record through a stdio
+/// buffer sized to the filesystem block size (4 KiB here), so a 1 GB capture
+/// costs ~250k `write(2)` calls. This writer packs the identical classic-pcap
+/// byte stream into buffers of this size instead.
+const WRITE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+/// Number of write buffers in flight (one being filled, the rest queued for or
+/// held by the writer thread). Bounds memory at `WRITE_BUFFER_BYTES * this`.
+const WRITE_BUFFER_COUNT: usize = 3;
+
+/// Classic-pcap savefile writer, byte-compatible with `pcap_dump`.
+///
+/// Two changes against the libpcap dumper it replaces, neither of which alters
+/// the emitted bytes:
+///
+/// * Records are packed into 4 MiB buffers instead of libpcap's two `fwrite`
+///   calls per record through a block-sized stdio buffer.
+/// * Full buffers are handed to a writer thread, so the `write(2)` syscalls
+///   overlap with reading and rewriting the next records rather than stalling
+///   the single worker. Buffers are recycled back, so steady-state allocation
+///   is zero.
+///
+/// Header fields are written in host byte order exactly as libpcap does (the
+/// magic then reads back as `0xa1b2c3d4` on the writing host), the snaplen is
+/// the 65535 that `Capture::dead` installs, and record headers carry the 32-bit
+/// truncation of the timestamp that `pcap_dump` performs.
+struct PcapWriter {
+    buf: Vec<u8>,
+    full: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    recycled: std::sync::mpsc::Receiver<Vec<u8>>,
+    worker: Option<std::thread::JoinHandle<Result<(), std::io::Error>>>,
+}
+
+impl PcapWriter {
+    fn create(path: &Path, linktype: Linktype) -> Result<Self, std::io::Error> {
+        let mut file = fs::File::create(path)?;
+        let mut header = [0u8; 24];
+        header[0..4].copy_from_slice(&0xa1b2_c3d4u32.to_ne_bytes());
+        header[4..6].copy_from_slice(&2u16.to_ne_bytes()); // version major
+        header[6..8].copy_from_slice(&4u16.to_ne_bytes()); // version minor
+        header[8..12].copy_from_slice(&0i32.to_ne_bytes()); // thiszone
+        header[12..16].copy_from_slice(&0u32.to_ne_bytes()); // sigfigs
+        header[16..20].copy_from_slice(&65_535u32.to_ne_bytes()); // snaplen
+        header[20..24].copy_from_slice(&(linktype.0 as u32).to_ne_bytes());
+        file.write_all(&header)?;
+
+        let (full_tx, full_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(WRITE_BUFFER_COUNT);
+        let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+        let worker = std::thread::Builder::new()
+            .name("pcap-writer".to_string())
+            .spawn(move || -> Result<(), std::io::Error> {
+                let mut result = Ok(());
+                for mut chunk in full_rx {
+                    if result.is_ok()
+                        && let Err(e) = file.write_all(&chunk)
+                    {
+                        result = Err(e);
+                    }
+                    chunk.clear();
+                    // A closed recycle channel just means the producer is gone.
+                    let _ = recycle_tx.send(chunk);
+                }
+                result
+            })?;
+
+        Ok(Self {
+            buf: Vec::with_capacity(WRITE_BUFFER_BYTES),
+            full: Some(full_tx),
+            recycled: recycle_rx,
+            worker: Some(worker),
+        })
+    }
+
+    #[inline]
+    fn write(&mut self, header: &pcap::PacketHeader, data: &[u8]) -> Result<(), std::io::Error> {
+        let mut record = [0u8; 16];
+        record[0..4].copy_from_slice(&(header.ts.tv_sec as u32).to_ne_bytes());
+        record[4..8].copy_from_slice(&(header.ts.tv_usec as u32).to_ne_bytes());
+        record[8..12].copy_from_slice(&(data.len() as u32).to_ne_bytes());
+        record[12..16].copy_from_slice(&header.len.to_ne_bytes());
+        self.buf.extend_from_slice(&record);
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= WRITE_BUFFER_BYTES {
+            self.dispatch()?;
+        }
+        Ok(())
+    }
+
+    /// Hand the filled buffer to the writer thread and take a recycled one.
+    fn dispatch(&mut self) -> Result<(), std::io::Error> {
+        let sender = match &self.full {
+            Some(sender) => sender,
+            None => return Ok(()),
+        };
+        // Take a spare buffer first: allocate until the pool is at its cap,
+        // then block on a recycled one, which is what bounds memory.
+        let spare = match self.recycled.try_recv() {
+            Ok(buf) => buf,
+            Err(std::sync::mpsc::TryRecvError::Empty) => Vec::with_capacity(WRITE_BUFFER_BYTES),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(std::io::Error::other("pcap writer thread stopped"));
+            }
+        };
+        let filled = std::mem::replace(&mut self.buf, spare);
+        if sender.send(filled).is_err() {
+            return Err(std::io::Error::other("pcap writer thread stopped"));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), std::io::Error> {
+        if !self.buf.is_empty() {
+            self.dispatch()?;
+        }
+        self.full = None; // close the queue so the worker drains and exits
+        match self.worker.take() {
+            Some(handle) => handle
+                .join()
+                .map_err(|_| std::io::Error::other("pcap writer thread panicked"))?,
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for PcapWriter {
+    fn drop(&mut self) {
+        self.full = None;
+        if let Some(handle) = self.worker.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Fold a 64-bit ones-complement accumulator down to the final 16-bit value.
+///
+/// Identical result to `pnet_packet::util::finalize_checksum`, which folds a
+/// 32-bit accumulator; folding is associative so a wider accumulator is safe.
+#[inline]
+fn fold_checksum(mut sum: u64) -> u16 {
+    while sum >> 16 != 0 {
+        sum = (sum >> 16) + (sum & 0xFFFF);
+    }
+    !(sum as u16)
+}
+
+/// Sum 16-bit big-endian words, eight bytes at a time.
+///
+/// Byte-for-byte equivalent to `pnet_packet::util::sum_be_words(data, usize::MAX)`
+/// (no skipped word) but reads 4 bytes per add instead of 2, so the compiler can
+/// keep the loop in registers. Callers zero the checksum field first, which is
+/// exactly what pnet's `skipword` argument emulates.
+///
+/// Overflow: each 8-byte chunk contributes at most 2^33, so a 64-bit accumulator
+/// cannot overflow for any capture record (even a 4 GiB one).
+#[inline]
+fn sum_be_words_fast(data: &[u8]) -> u64 {
+    let mut sum: u64 = 0;
+    let (chunks, rem) = data.as_chunks::<8>();
+    for c in chunks {
+        let hi = u32::from_be_bytes([c[0], c[1], c[2], c[3]]) as u64;
+        let lo = u32::from_be_bytes([c[4], c[5], c[6], c[7]]) as u64;
+        sum += hi + lo;
+    }
+    let mut i = 0;
+    while i + 2 <= rem.len() {
+        sum += u16::from_be_bytes([rem[i], rem[i + 1]]) as u64;
+        i += 2;
+    }
+    if i < rem.len() {
+        // Odd trailing byte is treated as the high half of a word, as pnet does.
+        sum += (rem[i] as u64) << 8;
+    }
+    sum
+}
+
+/// TCP/UDP checksum over an IPv4 pseudo-header plus `data`.
+///
+/// Equivalent to `pnet_packet::tcp::ipv4_checksum` / `udp::ipv4_checksum` when the
+/// segment's own checksum field has already been zeroed.
+#[inline]
+fn transport_checksum_ipv4(data: &[u8], src: &Ipv4Addr, dst: &Ipv4Addr, proto: u8) -> u16 {
+    let s = src.octets();
+    let d = dst.octets();
+    let mut sum: u64 = 0;
+    sum += (((s[0] as u64) << 8) | s[1] as u64) + (((s[2] as u64) << 8) | s[3] as u64);
+    sum += (((d[0] as u64) << 8) | d[1] as u64) + (((d[2] as u64) << 8) | d[3] as u64);
+    sum += proto as u64;
+    sum += data.len() as u64;
+    sum += sum_be_words_fast(data);
+    fold_checksum(sum)
+}
+
+/// Rewrite the transport checksum of an IPv4 payload in place.
+///
+/// `payload` is the IPv4 payload slice exactly as pnet would hand it to
+/// `MutableTcpPacket`/`MutableUdpPacket`, so the summed extent is unchanged.
+#[inline]
+fn set_transport_checksum_ipv4(
+    payload: &mut [u8],
+    protocol: IpNextHeaderProtocol,
+    src: &Ipv4Addr,
+    dst: &Ipv4Addr,
+) {
+    // Offset of the checksum field and the minimum packet size pnet enforces
+    // before it hands out a mutable view.
+    let (offset, min_len) = match protocol {
+        IpNextHeaderProtocols::Udp => (6usize, 8usize),
+        IpNextHeaderProtocols::Tcp => (16usize, 20usize),
+        _ => return,
+    };
+    if payload.len() < min_len {
+        return;
+    }
+    payload[offset] = 0;
+    payload[offset + 1] = 0;
+    let checksum = transport_checksum_ipv4(payload, src, dst, protocol.0);
+    payload[offset..offset + 2].copy_from_slice(&checksum.to_be_bytes());
+}
+
 fn default_output_path(input: &Path) -> PathBuf {
     let parent = input.parent().unwrap_or_else(|| Path::new("."));
     let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("pcap");
@@ -272,25 +492,13 @@ impl AddressRewriter {
             let checksum = ipv4_checksum(&ipv4_packet.to_immutable());
             ipv4_packet.set_checksum(checksum);
 
-            match ipv4_packet.get_next_level_protocol() {
-                IpNextHeaderProtocols::Udp => {
-                    if let Some(mut udp_packet) = MutableUdpPacket::new(ipv4_packet.payload_mut()) {
-                        udp_packet.set_checksum(0);
-                        let checksum =
-                            udp_ipv4_checksum(&udp_packet.to_immutable(), &mapped_src, &mapped_dst);
-                        udp_packet.set_checksum(checksum);
-                    }
-                }
-                IpNextHeaderProtocols::Tcp => {
-                    if let Some(mut tcp_packet) = MutableTcpPacket::new(ipv4_packet.payload_mut()) {
-                        tcp_packet.set_checksum(0);
-                        let checksum =
-                            tcp_ipv4_checksum(&tcp_packet.to_immutable(), &mapped_src, &mapped_dst);
-                        tcp_packet.set_checksum(checksum);
-                    }
-                }
-                _ => {}
-            }
+            let protocol = ipv4_packet.get_next_level_protocol();
+            set_transport_checksum_ipv4(
+                ipv4_packet.payload_mut(),
+                protocol,
+                &mapped_src,
+                &mapped_dst,
+            );
 
             return Ok(true);
         }
@@ -449,12 +657,20 @@ impl AddressRewriter {
     }
 }
 
-fn rewrite_ipv6_packet(
+/// Translate an IPv6 frame into the equivalent IPv4 frame, writing into `out`.
+///
+/// Writes straight into the caller's reusable buffer: the earlier version
+/// allocated three `Vec`s per packet (payload copy, IPv4 header, output frame).
+/// The emitted bytes are unchanged.
+fn rewrite_ipv6_packet_into(
     rewriter: &mut AddressRewriter,
-    ethernet: &EthernetPacket,
-) -> Result<Vec<u8>, String> {
+    frame: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    // `frame` has already been accepted by `EthernetPacket::new`, so the 14-byte
+    // header is present and `frame[14..]` is what pnet calls the payload.
     let ipv6_packet =
-        Ipv6Packet::new(ethernet.payload()).ok_or_else(|| "Malformed IPv6 payload".to_string())?;
+        Ipv6Packet::new(&frame[14..]).ok_or_else(|| "Malformed IPv6 payload".to_string())?;
 
     let src_v6 = ipv6_packet.get_source();
     let dst_v6 = ipv6_packet.get_destination();
@@ -464,53 +680,50 @@ fn rewrite_ipv6_packet(
 
     let next_header = ipv6_packet.get_next_header();
     let hop_limit = ipv6_packet.get_hop_limit();
-    let mut payload = ipv6_packet.payload().to_vec();
+    let payload = ipv6_packet.payload();
+    let payload_len = payload.len();
 
     match next_header {
-        IpNextHeaderProtocols::Udp => {
-            if let Some(mut udp_packet) = MutableUdpPacket::new(&mut payload) {
-                udp_packet.set_checksum(0);
-                let checksum =
-                    udp_ipv4_checksum(&udp_packet.to_immutable(), &mapped_src, &mapped_dst);
-                udp_packet.set_checksum(checksum);
-            } else {
-                return Err("Malformed UDP payload".to_string());
-            }
+        IpNextHeaderProtocols::Udp if payload_len < 8 => {
+            return Err("Malformed UDP payload".to_string());
         }
-        IpNextHeaderProtocols::Tcp => {
-            if let Some(mut tcp_packet) = MutableTcpPacket::new(&mut payload) {
-                tcp_packet.set_checksum(0);
-                let checksum =
-                    tcp_ipv4_checksum(&tcp_packet.to_immutable(), &mapped_src, &mapped_dst);
-                tcp_packet.set_checksum(checksum);
-            } else {
-                return Err("Malformed TCP payload".to_string());
-            }
+        IpNextHeaderProtocols::Tcp if payload_len < 20 => {
+            return Err("Malformed TCP payload".to_string());
         }
-        IpNextHeaderProtocols::Icmpv6 => {
-            if payload.len() >= 4 {
-                payload[0] = match payload[0] {
-                    128 => 8,
-                    129 => 0,
-                    other => other,
-                };
-                payload[2] = 0;
-                payload[3] = 0;
-                if let Some(mut icmp_packet) =
-                    pnet::packet::icmp::MutableIcmpPacket::new(&mut payload)
-                {
-                    icmp_packet.set_checksum(0);
-                    let checksum = pnet::packet::icmp::checksum(&icmp_packet.to_immutable());
-                    icmp_packet.set_checksum(checksum);
-                }
+        _ => {}
+    }
+
+    out.clear();
+    out.reserve(34 + payload_len);
+    out.extend_from_slice(&frame[0..12]); // destination then source MAC
+    out.extend_from_slice(&[0x08, 0x00]); // EtherTypes::Ipv4
+    out.resize(34, 0); // zeroed IPv4 header, filled in below
+    out.extend_from_slice(payload);
+
+    match next_header {
+        IpNextHeaderProtocols::Udp | IpNextHeaderProtocols::Tcp => {
+            set_transport_checksum_ipv4(&mut out[34..], next_header, &mapped_src, &mapped_dst);
+        }
+        IpNextHeaderProtocols::Icmpv6 if payload_len >= 4 => {
+            let icmp = &mut out[34..];
+            icmp[0] = match icmp[0] {
+                128 => 8,
+                129 => 0,
+                other => other,
+            };
+            icmp[2] = 0;
+            icmp[3] = 0;
+            if let Some(mut icmp_packet) = pnet::packet::icmp::MutableIcmpPacket::new(icmp) {
+                icmp_packet.set_checksum(0);
+                let checksum = pnet::packet::icmp::checksum(&icmp_packet.to_immutable());
+                icmp_packet.set_checksum(checksum);
             }
         }
         _ => {}
     }
 
-    let total_length = (20 + payload.len()) as u16;
-    let mut ipv4_bytes = vec![0u8; 20];
-    let mut ipv4_packet = MutableIpv4Packet::new(&mut ipv4_bytes)
+    let total_length = (20 + payload_len) as u16;
+    let mut ipv4_packet = MutableIpv4Packet::new(&mut out[14..34])
         .ok_or_else(|| "Failed to allocate IPv4 header".to_string())?;
     ipv4_packet.set_version(4);
     ipv4_packet.set_header_length(5);
@@ -526,19 +739,7 @@ fn rewrite_ipv6_packet(
     let checksum = ipv4_checksum(&ipv4_packet.to_immutable());
     ipv4_packet.set_checksum(checksum);
 
-    let mut frame = vec![0u8; 14 + ipv4_bytes.len() + payload.len()];
-    {
-        let mut ethernet_packet =
-            MutableEthernetPacket::new(&mut frame).ok_or_else(|| "Frame alloc".to_string())?;
-        ethernet_packet.set_destination(ethernet.get_destination());
-        ethernet_packet.set_source(ethernet.get_source());
-        ethernet_packet.set_ethertype(EtherTypes::Ipv4);
-        let ipv4_payload = ethernet_packet.payload_mut();
-        ipv4_payload[..20].copy_from_slice(&ipv4_bytes);
-        ipv4_payload[20..].copy_from_slice(&payload);
-    }
-
-    Ok(frame)
+    Ok(())
 }
 
 fn map_next_header(nh: IpNextHeaderProtocol) -> IpNextHeaderProtocol {
@@ -689,12 +890,10 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
         other => other,
     };
 
-    let dead = Capture::dead(output_linktype)?;
-    let output_path = config
-        .output
-        .to_str()
-        .ok_or("Output path must be valid UTF-8")?;
-    let mut writer = dead.savefile(output_path)?;
+    if config.output.to_str().is_none() {
+        return Err("Output path must be valid UTF-8".into());
+    }
+    let mut writer = PcapWriter::create(&config.output, output_linktype)?;
 
     let mut packets_total = 0_u64;
     let mut packets_converted = 0_u64;
@@ -705,6 +904,10 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
     let mut last_timestamp: Option<f64> = None;
     let mut warnings = Vec::new();
     let start = Instant::now();
+    // Frame buffers reused for every record; `scratch` receives SLL/IPv6
+    // conversions and is then swapped in.
+    let mut data: Vec<u8> = Vec::with_capacity(65_536);
+    let mut scratch: Vec<u8> = Vec::with_capacity(65_536);
 
     loop {
         match capture.next_packet() {
@@ -714,18 +917,20 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                     packet.header.ts.tv_sec as f64 + packet.header.ts.tv_usec as f64 / 1_000_000.0;
                 first_timestamp.get_or_insert(timestamp);
                 last_timestamp = Some(timestamp);
-                let mut data = packet.data.to_vec();
+                // Reusable frame buffers: no per-packet heap allocation.
+                data.clear();
+                data.extend_from_slice(packet.data);
                 let mut header = *packet.header;
 
                 if input_linktype == Linktype(113) {
-                    match convert_sll_to_ethernet(&data) {
-                        Ok(converted) => {
-                            if converted.len() != data.len() {
+                    match convert_sll_to_ethernet_into(&data, &mut scratch) {
+                        Ok(()) => {
+                            if scratch.len() != data.len() {
                                 packets_converted += 1;
                             }
-                            header.caplen = converted.len() as u32;
-                            header.len = converted.len() as u32;
-                            data = converted;
+                            header.caplen = scratch.len() as u32;
+                            header.len = scratch.len() as u32;
+                            std::mem::swap(&mut data, &mut scratch);
                         }
                         Err(e) => {
                             warnings.push(format!(
@@ -736,15 +941,15 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                     }
                 }
 
-                if let Some(ethernet_view) = EthernetPacket::new(&data)
-                    && ethernet_view.get_ethertype() == EtherTypes::Ipv6
-                {
-                    match rewrite_ipv6_packet(&mut address_rewriter, &ethernet_view) {
-                        Ok(converted) => {
+                let is_ipv6 = EthernetPacket::new(&data)
+                    .is_some_and(|view| view.get_ethertype() == EtherTypes::Ipv6);
+                if is_ipv6 {
+                    match rewrite_ipv6_packet_into(&mut address_rewriter, &data, &mut scratch) {
+                        Ok(()) => {
                             packets_ipv6_converted += 1;
-                            header.caplen = converted.len() as u32;
-                            header.len = converted.len() as u32;
-                            data = converted;
+                            header.caplen = scratch.len() as u32;
+                            header.len = scratch.len() as u32;
+                            std::mem::swap(&mut data, &mut scratch);
                         }
                         Err(e) => warnings.push(format!(
                             "IPv6 rewrite failed for packet {}: {} (packet left unchanged)",
@@ -769,8 +974,7 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 if clamp_record_len(&mut header) {
                     packets_len_clamped += 1;
                 }
-                let packet_for_write = pcap::Packet::new(&header, &data);
-                writer.write(&packet_for_write);
+                writer.write(&header, &data)?;
 
                 if config.progress_every > 0 && packets_total % config.progress_every == 0 {
                     let elapsed = start.elapsed().as_secs_f64().max(0.001);
@@ -820,7 +1024,7 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
         }
     }
 
-    writer.flush()?;
+    writer.finish()?;
 
     let mut outcome = RewriteOutcome {
         stats: RewriteStats {
@@ -884,7 +1088,8 @@ fn detect_capture_format(path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(format)
 }
 
-fn convert_sll_to_ethernet(data: &[u8]) -> Result<Vec<u8>, String> {
+/// Convert a LINUX_SLL frame to Ethernet, writing into the caller's buffer.
+fn convert_sll_to_ethernet_into(data: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
     if data.len() < 16 {
         return Err("SLL frame too short".to_string());
     }
@@ -897,12 +1102,13 @@ fn convert_sll_to_ethernet(data: &[u8]) -> Result<Vec<u8>, String> {
 
     let (src_mac, dst_mac) = derive_macs(payload);
 
-    let mut ethernet = Vec::with_capacity(14 + payload.len());
-    ethernet.extend_from_slice(&dst_mac);
-    ethernet.extend_from_slice(&src_mac);
-    ethernet.extend_from_slice(&proto.to_be_bytes());
-    ethernet.extend_from_slice(payload);
-    Ok(ethernet)
+    out.clear();
+    out.reserve(14 + payload.len());
+    out.extend_from_slice(&dst_mac);
+    out.extend_from_slice(&src_mac);
+    out.extend_from_slice(&proto.to_be_bytes());
+    out.extend_from_slice(payload);
+    Ok(())
 }
 
 fn derive_macs(payload: &[u8]) -> ([u8; 6], [u8; 6]) {
@@ -959,6 +1165,48 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    /// The hand-written 64-bit accumulator must agree with pnet's 32-bit,
+    /// two-bytes-at-a-time reference for every length and alignment, otherwise
+    /// rewritten captures would differ from earlier runs.
+    #[test]
+    fn fast_transport_checksum_matches_pnet() {
+        use pnet::packet::tcp::{MutableTcpPacket, ipv4_checksum as tcp_ipv4_checksum};
+        use pnet::packet::udp::{MutableUdpPacket, ipv4_checksum as udp_ipv4_checksum};
+
+        let src = Ipv4Addr::new(10, 0, 1, 1);
+        let dst = Ipv4Addr::new(10, 0, 5, 4);
+        // Deterministic pseudo-random payloads over every length that exercises
+        // the 8-byte fast path, the 2-byte tail and the odd trailing byte.
+        let mut state: u32 = 0x1234_5678;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        for len in 8..=200usize {
+            let mut udp: Vec<u8> = (0..len).map(|_| next()).collect();
+            udp[6] = 0;
+            udp[7] = 0;
+            let reference = {
+                let pkt = MutableUdpPacket::new(&mut udp).expect("udp view");
+                udp_ipv4_checksum(&pkt.to_immutable(), &src, &dst)
+            };
+            let fast = transport_checksum_ipv4(&udp, &src, &dst, IpNextHeaderProtocols::Udp.0);
+            assert_eq!(reference, fast, "udp length {}", len);
+
+            if len >= 20 {
+                let mut tcp: Vec<u8> = (0..len).map(|_| next()).collect();
+                tcp[16] = 0;
+                tcp[17] = 0;
+                let reference = {
+                    let pkt = MutableTcpPacket::new(&mut tcp).expect("tcp view");
+                    tcp_ipv4_checksum(&pkt.to_immutable(), &src, &dst)
+                };
+                let fast = transport_checksum_ipv4(&tcp, &src, &dst, IpNextHeaderProtocols::Tcp.0);
+                assert_eq!(reference, fast, "tcp length {}", len);
+            }
+        }
+    }
 
     #[test]
     fn default_output_keeps_extension() {
