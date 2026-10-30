@@ -399,6 +399,37 @@ fn default_output_path(input: &Path) -> PathBuf {
     parent.join(format!("{}_rewritten.{}", stem, ext))
 }
 
+/// UDP/TCP ports reserved for INT reports to the collectors (9080 + collector
+/// index; env/controller/int_pipeline.py). The controller forwards ANY packet
+/// with these destination ports to a collector, which parses it as telemetry,
+/// so a replayed packet must never carry one.
+const RESERVED_INT_PORTS: std::ops::RangeInclusive<u16> = 9080..=9089;
+/// Replacement offset for a reserved port (9080 -> 10080, ...).
+const RESERVED_PORT_SHIFT: u16 = 1000;
+/// DSCP that the P4 parser treats as an INT shim (p4src/include/int_definitions.p4).
+const INT_DSCP: u8 = 0x17;
+
+/// Move TCP/UDP source and destination ports out of the INT report range.
+/// `transport` starts at the TCP/UDP header. Returns true when a port changed;
+/// the caller recomputes the checksum.
+fn guard_reserved_ports(transport: &mut [u8], protocol: IpNextHeaderProtocol) -> bool {
+    if !matches!(protocol, IpNextHeaderProtocols::Tcp | IpNextHeaderProtocols::Udp)
+        || transport.len() < 4
+    {
+        return false;
+    }
+    let mut changed = false;
+    for off in [0usize, 2] {
+        let port = u16::from_be_bytes([transport[off], transport[off + 1]]);
+        if RESERVED_INT_PORTS.contains(&port) {
+            let moved = port + RESERVED_PORT_SHIFT;
+            transport[off..off + 2].copy_from_slice(&moved.to_be_bytes());
+            changed = true;
+        }
+    }
+    changed
+}
+
 struct AddressRewriter {
     /// Ordered list of unique edge host addresses (group A followed by group B).
     edge_ips: Vec<Ipv4Addr>,
@@ -425,7 +456,22 @@ impl AddressRewriter {
                 if node_type != "host" {
                     continue;
                 }
-                let name = node.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                // Topologies write "id" (env/topo.py); older files used "name".
+                let name = node
+                    .get("id")
+                    .or_else(|| node.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                // INT collectors are never traffic endpoints: replayed packets
+                // addressed to them were ingested as telemetry (2026-10-30).
+                let is_collector = node
+                    .get("isCollector")
+                    .and_then(|c| c.as_bool())
+                    .unwrap_or(false)
+                    || name.starts_with("hc");
+                if is_collector {
+                    continue;
+                }
                 let ip_str = node.get("ip").and_then(|i| i.as_str()).unwrap_or("");
                 if let Some(ip) = parse_ipv4(ip_str) {
                     match name {
@@ -485,6 +531,20 @@ impl AddressRewriter {
         if mapped_dst != original_dst {
             ipv4_packet.set_destination(mapped_dst);
             changed = true;
+        }
+        // A captured DSCP equal to the INT DSCP would make the switch parse the
+        // packet as INT; keep ECN, clear the DSCP.
+        let tos = ipv4_packet.get_dscp();
+        if tos == INT_DSCP {
+            ipv4_packet.set_dscp(0);
+            changed = true;
+        }
+        // Only the first fragment carries the transport header.
+        if ipv4_packet.get_fragment_offset() == 0 {
+            let protocol = ipv4_packet.get_next_level_protocol();
+            if guard_reserved_ports(ipv4_packet.payload_mut(), protocol) {
+                changed = true;
+            }
         }
 
         if changed {
@@ -702,6 +762,7 @@ fn rewrite_ipv6_packet_into(
 
     match next_header {
         IpNextHeaderProtocols::Udp | IpNextHeaderProtocols::Tcp => {
+            guard_reserved_ports(&mut out[34..], next_header);
             set_transport_checksum_ipv4(&mut out[34..], next_header, &mapped_src, &mapped_dst);
         }
         IpNextHeaderProtocols::Icmpv6 if payload_len >= 4 => {
@@ -1477,4 +1538,95 @@ mod tests {
         bytes.extend_from_slice(&frame);
         Ok(bytes)
     }
+
+    /// The topology env/topo.py writes: hosts keyed by "id", collectors flagged.
+    fn topology_with_collectors(dir: &std::path::Path) -> PathBuf {
+        let topo = serde_json::json!({"nodes": [
+            {"id": "s1", "type": "switch"},
+            {"id": "h1", "type": "host", "ip": "10.0.1.1/24"},
+            {"id": "h2", "type": "host", "ip": "10.0.1.2/24"},
+            {"id": "h3", "type": "host", "ip": "10.0.5.3/24"},
+            {"id": "h4", "type": "host", "ip": "10.0.5.4/24"},
+            {"id": "hc1", "type": "host", "isCollector": true, "ip": "10.0.2.1/24"},
+            {"id": "hc2", "type": "host", "isCollector": true, "ip": "10.0.3.1/24"},
+            {"id": "hc3", "type": "host", "isCollector": true, "ip": "10.0.4.1/24"}
+        ]});
+        let path = dir.join("topology.json");
+        fs::write(&path, serde_json::to_vec(&topo).unwrap()).unwrap();
+        path
+    }
+
+    /// 2026-10-30: the pool read "name" while topologies write "id", so every
+    /// host fell to the subnet heuristic and the INT collectors became replay
+    /// destinations; the collector then ingested replayed packets as telemetry.
+    #[test]
+    fn collectors_are_never_in_the_address_pool() {
+        let tmp = tempdir().unwrap();
+        let rw = AddressRewriter::new(Some(&topology_with_collectors(tmp.path())));
+        let collectors = [
+            Ipv4Addr::new(10, 0, 2, 1),
+            Ipv4Addr::new(10, 0, 3, 1),
+            Ipv4Addr::new(10, 0, 4, 1),
+        ];
+        assert_eq!(rw.group_a, vec![Ipv4Addr::new(10, 0, 1, 1), Ipv4Addr::new(10, 0, 1, 2)]);
+        assert_eq!(rw.group_b, vec![Ipv4Addr::new(10, 0, 5, 3), Ipv4Addr::new(10, 0, 5, 4)]);
+        assert!(rw.edge_ips.iter().all(|ip| !collectors.contains(ip)));
+    }
+
+    #[test]
+    fn no_original_address_maps_onto_a_collector() {
+        let tmp = tempdir().unwrap();
+        let mut rw = AddressRewriter::new(Some(&topology_with_collectors(tmp.path())));
+        for i in 0..2000u32 {
+            let src = Ipv4Addr::from(0xC000_0000u32.wrapping_add(i.wrapping_mul(2_654_435_761)));
+            let dst = Ipv4Addr::from(0x0A00_0000u32.wrapping_add(i.wrapping_mul(40_503)));
+            let ms = rw.map_ipv4_with_preference(src, None);
+            let md = rw.map_ipv4_with_preference(dst, Some(ms));
+            for m in [ms, md] {
+                assert!(m.octets()[2] == 1 || m.octets()[2] == 5, "mapped onto {}", m);
+            }
+        }
+    }
+
+    /// A captured port in the INT report range would be forwarded to a collector
+    /// by the controller's catch-all rule; a captured INT DSCP would be parsed as
+    /// an INT shim. Both are rewritten, and the checksums stay valid.
+    #[test]
+    fn reserved_int_ports_and_dscp_are_rewritten() {
+        let tmp = tempdir().unwrap();
+        let mut rw = AddressRewriter::new(Some(&topology_with_collectors(tmp.path())));
+        let mut frame = vec![0u8; 14 + 20 + 8];
+        {
+            let mut eth = MutableEthernetPacket::new(&mut frame).unwrap();
+            eth.set_ethertype(EtherTypes::Ipv4);
+            let mut ip = MutableIpv4Packet::new(eth.payload_mut()).unwrap();
+            ip.set_version(4);
+            ip.set_header_length(5);
+            ip.set_total_length(28);
+            ip.set_ttl(64);
+            ip.set_dscp(INT_DSCP);
+            ip.set_ecn(1);
+            ip.set_next_level_protocol(IpNextHeaderProtocols::Udp);
+            ip.set_source(Ipv4Addr::new(8, 8, 8, 8));
+            ip.set_destination(Ipv4Addr::new(192, 168, 7, 9));
+            let mut udp = MutableUdpPacket::new(ip.payload_mut()).unwrap();
+            udp.set_source(53);
+            udp.set_destination(9080);
+            udp.set_length(8);
+        }
+        let mut eth = MutableEthernetPacket::new(&mut frame).unwrap();
+        assert!(rw.rewrite_ipv4(&mut eth).unwrap());
+        let ip = Ipv4Packet::new(eth.payload()).unwrap();
+        assert_eq!(ip.get_dscp(), 0, "INT DSCP cleared");
+        assert_eq!(ip.get_ecn(), 1, "ECN kept");
+        assert_eq!(ip.get_checksum(), ipv4_checksum(&ip));
+        let udp = pnet::packet::udp::UdpPacket::new(ip.payload()).unwrap();
+        assert_eq!(udp.get_source(), 53, "service ports outside the range are kept");
+        assert_eq!(udp.get_destination(), 10080);
+        assert_eq!(
+            udp.get_checksum(),
+            udp_ipv4_checksum(&udp, &ip.get_source(), &ip.get_destination())
+        );
+    }
 }
+
