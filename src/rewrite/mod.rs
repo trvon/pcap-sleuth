@@ -413,8 +413,10 @@ const INT_DSCP: u8 = 0x17;
 /// `transport` starts at the TCP/UDP header. Returns true when a port changed;
 /// the caller recomputes the checksum.
 fn guard_reserved_ports(transport: &mut [u8], protocol: IpNextHeaderProtocol) -> bool {
-    if !matches!(protocol, IpNextHeaderProtocols::Tcp | IpNextHeaderProtocols::Udp)
-        || transport.len() < 4
+    if !matches!(
+        protocol,
+        IpNextHeaderProtocols::Tcp | IpNextHeaderProtocols::Udp
+    ) || transport.len() < 4
     {
         return false;
     }
@@ -1374,9 +1376,14 @@ mod tests {
         let output = tmp.path().join("badlen_rewritten.pcap");
         let mut out_cap = Capture::from_file(&output)?;
         let packet = out_cap.next_packet().expect("one packet");
-        assert!(packet.header.len >= packet.header.caplen,
-                "len {} < caplen {}", packet.header.len, packet.header.caplen);
-        let manifest_json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&manifest)?)?;
+        assert!(
+            packet.header.len >= packet.header.caplen,
+            "len {} < caplen {}",
+            packet.header.len,
+            packet.header.caplen
+        );
+        let manifest_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest)?)?;
         assert_eq!(manifest_json["stats"]["packets_len_clamped"], 1);
         Ok(())
     }
@@ -1568,8 +1575,14 @@ mod tests {
             Ipv4Addr::new(10, 0, 3, 1),
             Ipv4Addr::new(10, 0, 4, 1),
         ];
-        assert_eq!(rw.group_a, vec![Ipv4Addr::new(10, 0, 1, 1), Ipv4Addr::new(10, 0, 1, 2)]);
-        assert_eq!(rw.group_b, vec![Ipv4Addr::new(10, 0, 5, 3), Ipv4Addr::new(10, 0, 5, 4)]);
+        assert_eq!(
+            rw.group_a,
+            vec![Ipv4Addr::new(10, 0, 1, 1), Ipv4Addr::new(10, 0, 1, 2)]
+        );
+        assert_eq!(
+            rw.group_b,
+            vec![Ipv4Addr::new(10, 0, 5, 3), Ipv4Addr::new(10, 0, 5, 4)]
+        );
         assert!(rw.edge_ips.iter().all(|ip| !collectors.contains(ip)));
     }
 
@@ -1583,7 +1596,11 @@ mod tests {
             let ms = rw.map_ipv4_with_preference(src, None);
             let md = rw.map_ipv4_with_preference(dst, Some(ms));
             for m in [ms, md] {
-                assert!(m.octets()[2] == 1 || m.octets()[2] == 5, "mapped onto {}", m);
+                assert!(
+                    m.octets()[2] == 1 || m.octets()[2] == 5,
+                    "mapped onto {}",
+                    m
+                );
             }
         }
     }
@@ -1621,7 +1638,11 @@ mod tests {
         assert_eq!(ip.get_ecn(), 1, "ECN kept");
         assert_eq!(ip.get_checksum(), ipv4_checksum(&ip));
         let udp = pnet::packet::udp::UdpPacket::new(ip.payload()).unwrap();
-        assert_eq!(udp.get_source(), 53, "service ports outside the range are kept");
+        assert_eq!(
+            udp.get_source(),
+            53,
+            "service ports outside the range are kept"
+        );
         assert_eq!(udp.get_destination(), 10080);
         assert_eq!(
             udp.get_checksum(),
@@ -1629,4 +1650,3 @@ mod tests {
         );
     }
 }
-
