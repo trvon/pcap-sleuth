@@ -65,6 +65,13 @@ pub struct RewriteCli {
     /// the manifest. Absent: the deterministic, unsalted mapping of earlier runs.
     #[arg(long, value_name = "SEED")]
     pub seed: Option<u64>,
+
+    /// Keep only a window of this many capture-seconds (replayed at native
+    /// speed by the caller). The window start is a seed-derived fraction of
+    /// (duration - window), 0 without a seed; captures no longer than the
+    /// window are kept whole. Start and source duration go to the manifest.
+    #[arg(long, value_name = "SECONDS")]
+    pub window_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +84,7 @@ pub struct RewriteConfig {
     pub progress_every: u64,
     pub max_packets: Option<u64>,
     pub seed: Option<u64>,
+    pub window_seconds: Option<f64>,
 }
 
 impl RewriteConfig {
@@ -95,6 +103,7 @@ impl RewriteConfig {
             progress_every: cli.progress_every,
             max_packets: cli.max_packets,
             seed: cli.seed,
+            window_seconds: cli.window_seconds,
         }
     }
 }
@@ -174,6 +183,14 @@ struct RewriteStats {
     seed: Option<u64>,
     /// Offset added (mod 32768) to ephemeral ports >= 32768 under `seed`.
     ephemeral_port_offset: Option<u16>,
+    /// Requested window length (capture seconds), when windowing was asked for.
+    window_seconds: Option<f64>,
+    /// Window start relative to the first packet (seconds).
+    window_start_seconds: Option<f64>,
+    /// Full source capture span (seconds), measured before windowing.
+    source_duration_seconds: Option<f64>,
+    /// Packets dropped because they fell outside the window.
+    packets_outside_window: u64,
 }
 
 #[derive(Debug, Default)]
@@ -442,6 +459,46 @@ fn guard_reserved_ports(transport: &mut [u8], protocol: IpNextHeaderProtocol) ->
         }
     }
     changed
+}
+
+/// Seed-derived fraction in [0, 1) placing the replay window.
+fn window_fraction(seed: Option<u64>) -> f64 {
+    match seed {
+        None => 0.0,
+        Some(seed) => {
+            let d = md5::compute(format!("window|{}", seed).as_bytes());
+            f64::from(u32::from_be_bytes([d[0], d[1], d[2], d[3]])) / (f64::from(u32::MAX) + 1.0)
+        }
+    }
+}
+
+/// (min, max) packet timestamp of a capture, in seconds: one header-only pass.
+fn capture_span(path: &Path) -> Result<Option<(f64, f64)>, Box<dyn Error>> {
+    let mut cap = Capture::from_file(path)?;
+    let mut span: Option<(f64, f64)> = None;
+    while let Ok(packet) = cap.next_packet() {
+        let t = packet.header.ts.tv_sec as f64 + packet.header.ts.tv_usec as f64 / 1_000_000.0;
+        span = Some(match span {
+            None => (t, t),
+            Some((lo, hi)) => (lo.min(t), hi.max(t)),
+        });
+    }
+    Ok(span)
+}
+
+/// The kept window [start, end) in absolute seconds, or None to keep everything.
+fn replay_window(
+    span: Option<(f64, f64)>,
+    window: f64,
+    seed: Option<u64>,
+) -> Option<(f64, f64, f64)> {
+    let (lo, hi) = span?;
+    let duration = hi - lo;
+    if window <= 0.0 || duration <= window {
+        return None;
+    }
+    let start = window_fraction(seed) * (duration - window);
+    Some((lo + start, lo + start + window, start))
 }
 
 /// First ephemeral port that the variation seed shifts (IANA dynamic range
@@ -1012,6 +1069,10 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 edge_hosts_used: Vec::new(),
                 seed: config.seed,
                 ephemeral_port_offset: config.seed.map(|_| address_rewriter.port_offset),
+                window_seconds: None,
+                window_start_seconds: None,
+                source_duration_seconds: None,
+                packets_outside_window: 0,
             },
             warnings: vec![
                 "Dry-run mode: output capture not written".to_string(),
@@ -1036,6 +1097,15 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
     }
     let mut writer = PcapWriter::create(&config.output, output_linktype)?;
 
+    let span = match config.window_seconds {
+        Some(_) => capture_span(&config.input)?,
+        None => None,
+    };
+    let window = config
+        .window_seconds
+        .and_then(|w| replay_window(span, w, config.seed));
+    let mut packets_outside_window = 0_u64;
+
     let mut packets_total = 0_u64;
     let mut packets_converted = 0_u64;
     let mut packets_remapped = 0_u64;
@@ -1056,6 +1126,12 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 packets_total += 1;
                 let timestamp =
                     packet.header.ts.tv_sec as f64 + packet.header.ts.tv_usec as f64 / 1_000_000.0;
+                if let Some((lo, hi, _)) = window
+                    && (timestamp < lo || timestamp >= hi)
+                {
+                    packets_outside_window += 1;
+                    continue;
+                }
                 first_timestamp.get_or_insert(timestamp);
                 last_timestamp = Some(timestamp);
                 // Reusable frame buffers: no per-packet heap allocation.
@@ -1184,6 +1260,10 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
             edge_hosts_used: Vec::new(),
             seed: config.seed,
             ephemeral_port_offset: config.seed.map(|_| address_rewriter.port_offset),
+            window_seconds: config.window_seconds,
+            window_start_seconds: window.map(|w| w.2).or(config.window_seconds.map(|_| 0.0)),
+            source_duration_seconds: span.map(|(lo, hi)| hi - lo),
+            packets_outside_window,
         },
         warnings,
     };
@@ -1375,6 +1455,7 @@ mod tests {
             progress_every: 0,
             max_packets: None,
             seed: None,
+            window_seconds: None,
         };
 
         run(cli)?;
@@ -1405,6 +1486,7 @@ mod tests {
             progress_every: 0,
             max_packets: None,
             seed: None,
+            window_seconds: None,
         };
 
         run(cli)?;
@@ -1454,6 +1536,7 @@ mod tests {
             progress_every: 0,
             max_packets: None,
             seed: None,
+            window_seconds: None,
         };
         run(cli)?;
         let output = tmp.path().join("badlen_rewritten.pcap");
@@ -1490,6 +1573,7 @@ mod tests {
             progress_every: 0,
             max_packets: None,
             seed: None,
+            window_seconds: None,
         };
 
         run(cli)?;
@@ -1839,6 +1923,7 @@ mod tests {
             progress_every: 0,
             max_packets: None,
             seed: Some(42),
+            window_seconds: None,
         };
         run(cli)?;
         let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
@@ -1847,6 +1932,91 @@ mod tests {
             m["stats"]["ephemeral_port_offset"],
             u64::from(ephemeral_port_offset(42))
         );
+        Ok(())
+    }
+
+    /// A classic pcap with one UDP packet per second for `seconds` seconds.
+    fn timed_pcap(seconds: u32) -> Result<Vec<u8>, Box<dyn Error>> {
+        let one = minimal_pcap_with_packet()?;
+        let frame = &one[24 + 16..];
+        let mut bytes = minimal_pcap_header();
+        for t in 0..seconds {
+            bytes.extend_from_slice(&(1_000 + t).to_le_bytes()); // ts sec
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // ts usec
+            bytes.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(frame);
+        }
+        Ok(bytes)
+    }
+
+    fn windowed(
+        seconds: u32,
+        window: f64,
+        seed: Option<u64>,
+    ) -> Result<serde_json::Value, Box<dyn Error>> {
+        let tmp = tempdir()?;
+        let input = tmp.path().join("in.pcap");
+        fs::write(&input, timed_pcap(seconds)?)?;
+        let manifest = tmp.path().join("m.json");
+        run(RewriteCli {
+            input,
+            output: Some(tmp.path().join("out.pcap")),
+            manifest: Some(manifest.clone()),
+            topology: Some(topology_with_collectors(tmp.path())),
+            verbose: 0,
+            dry_run: false,
+            progress_every: 0,
+            max_packets: None,
+            seed,
+            window_seconds: Some(window),
+        })?;
+        let mut m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
+        let mut cap = Capture::from_file(tmp.path().join("out.pcap"))?;
+        let mut kept = 0u64;
+        let mut first = None;
+        while let Ok(p) = cap.next_packet() {
+            kept += 1;
+            first.get_or_insert(p.header.ts.tv_sec as u64);
+        }
+        m["kept"] = kept.into();
+        m["first_sec"] = first.unwrap_or(0).into();
+        Ok(m)
+    }
+
+    /// Native-speed windows (2026-10-30): every capture replays at real speed,
+    /// so a long one contributes a seeded S-second window instead of being
+    /// squeezed into S seconds (the squeeze ratio identified the dataset).
+    #[test]
+    fn a_long_capture_keeps_a_seeded_window_at_its_own_timing() -> Result<(), Box<dyn Error>> {
+        let a = windowed(100, 10.0, Some(3))?;
+        let b = windowed(100, 10.0, Some(4))?;
+        let none = windowed(100, 10.0, None)?;
+        assert_eq!(a["kept"], 10);
+        assert_eq!(a["stats"]["packets_outside_window"], 90);
+        assert_eq!(a["stats"]["source_duration_seconds"], 99.0);
+        let start = a["stats"]["window_start_seconds"].as_f64().unwrap();
+        assert!((0.0..=89.0).contains(&start));
+        assert_eq!(
+            a["first_sec"].as_u64().unwrap(),
+            1_000 + start.ceil() as u64,
+            "timing is the capture's own"
+        );
+        assert_ne!(
+            a["stats"]["window_start_seconds"], b["stats"]["window_start_seconds"],
+            "the seed moves the window"
+        );
+        assert_eq!(none["stats"]["window_start_seconds"], 0.0);
+        assert_eq!(none["first_sec"], 1_000);
+        Ok(())
+    }
+
+    #[test]
+    fn a_capture_shorter_than_the_window_is_kept_whole() -> Result<(), Box<dyn Error>> {
+        let m = windowed(5, 10.0, Some(3))?;
+        assert_eq!(m["kept"], 5);
+        assert_eq!(m["stats"]["packets_outside_window"], 0);
+        assert_eq!(m["stats"]["window_start_seconds"], 0.0);
         Ok(())
     }
 }
