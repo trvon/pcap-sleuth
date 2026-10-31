@@ -59,6 +59,12 @@ pub struct RewriteCli {
     /// Stop after N packets (useful for large-capture benchmarking)
     #[arg(long, value_name = "N")]
     pub max_packets: Option<u64>,
+
+    /// Per-episode variation seed. Salts the address mapping and shifts
+    /// ephemeral ports (>= 32768) by a seed-derived offset; both are recorded in
+    /// the manifest. Absent: the deterministic, unsalted mapping of earlier runs.
+    #[arg(long, value_name = "SEED")]
+    pub seed: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +76,7 @@ pub struct RewriteConfig {
     pub dry_run: bool,
     pub progress_every: u64,
     pub max_packets: Option<u64>,
+    pub seed: Option<u64>,
 }
 
 impl RewriteConfig {
@@ -87,6 +94,7 @@ impl RewriteConfig {
             dry_run: cli.dry_run,
             progress_every: cli.progress_every,
             max_packets: cli.max_packets,
+            seed: cli.seed,
         }
     }
 }
@@ -162,6 +170,10 @@ struct RewriteStats {
     linktype_in: String,
     linktype_out: String,
     edge_hosts_used: Vec<String>,
+    /// Variation seed in force (None: unsalted mapping, ports untouched).
+    seed: Option<u64>,
+    /// Offset added (mod 32768) to ephemeral ports >= 32768 under `seed`.
+    ephemeral_port_offset: Option<u16>,
 }
 
 #[derive(Debug, Default)]
@@ -432,6 +444,48 @@ fn guard_reserved_ports(transport: &mut [u8], protocol: IpNextHeaderProtocol) ->
     changed
 }
 
+/// First ephemeral port that the variation seed shifts (IANA dynamic range
+/// starts at 49152; 32768 covers the Linux default range too).
+const EPHEMERAL_PORT_FLOOR: u16 = 32768;
+
+/// Seed-derived ephemeral-port offset in 1..32768.
+fn ephemeral_port_offset(seed: u64) -> u16 {
+    let digest = md5::compute(format!("ports|{}", seed).as_bytes());
+    let v = u16::from_be_bytes([digest[0], digest[1]]) % (u16::MAX - EPHEMERAL_PORT_FLOOR);
+    v + 1
+}
+
+/// Shift TCP/UDP ports >= 32768 by `offset`, wrapping within [32768, 65535].
+/// A function of the port value alone, so both directions of a flow stay
+/// consistent. Returns true when a port changed.
+fn shift_ephemeral_ports(
+    transport: &mut [u8],
+    protocol: IpNextHeaderProtocol,
+    offset: u16,
+) -> bool {
+    if offset == 0
+        || !matches!(
+            protocol,
+            IpNextHeaderProtocols::Tcp | IpNextHeaderProtocols::Udp
+        )
+        || transport.len() < 4
+    {
+        return false;
+    }
+    let span = u32::from(u16::MAX - EPHEMERAL_PORT_FLOOR) + 1; // 32768
+    let mut changed = false;
+    for off in [0usize, 2] {
+        let port = u16::from_be_bytes([transport[off], transport[off + 1]]);
+        if port >= EPHEMERAL_PORT_FLOOR {
+            let rel = (u32::from(port - EPHEMERAL_PORT_FLOOR) + u32::from(offset)) % span;
+            let moved = EPHEMERAL_PORT_FLOOR + rel as u16;
+            transport[off..off + 2].copy_from_slice(&moved.to_be_bytes());
+            changed |= moved != port;
+        }
+    }
+    changed
+}
+
 struct AddressRewriter {
     /// Ordered list of unique edge host addresses (group A followed by group B).
     edge_ips: Vec<Ipv4Addr>,
@@ -441,10 +495,18 @@ struct AddressRewriter {
     group_b: Vec<Ipv4Addr>,
     mapping_v4: HashMap<Ipv4Addr, Ipv4Addr>,
     mapping_v6: HashMap<Ipv6Addr, Ipv4Addr>,
+    /// Variation seed: salts every address hash.
+    seed: Option<u64>,
+    /// Ephemeral-port shift under `seed` (0 when unseeded).
+    port_offset: u16,
 }
 
 impl AddressRewriter {
     fn new(topology_path: Option<&Path>) -> Self {
+        Self::with_seed(topology_path, None)
+    }
+
+    fn with_seed(topology_path: Option<&Path>, seed: Option<u64>) -> Self {
         let mut group_a: Vec<Ipv4Addr> = Vec::new();
         let mut group_b: Vec<Ipv4Addr> = Vec::new();
 
@@ -506,12 +568,15 @@ impl AddressRewriter {
             edge_ips, group_a, group_b
         );
 
+        let port_offset = seed.map(ephemeral_port_offset).unwrap_or(0);
         Self {
             edge_ips,
             group_a,
             group_b,
             mapping_v4: HashMap::new(),
             mapping_v6: HashMap::new(),
+            seed,
+            port_offset,
         }
     }
 
@@ -547,6 +612,9 @@ impl AddressRewriter {
             if guard_reserved_ports(ipv4_packet.payload_mut(), protocol) {
                 changed = true;
             }
+            if shift_ephemeral_ports(ipv4_packet.payload_mut(), protocol, self.port_offset) {
+                changed = true;
+            }
         }
 
         if changed {
@@ -579,7 +647,10 @@ impl AddressRewriter {
         if self.edge_ips.is_empty() {
             return ip;
         }
-        let ip_string = ip.to_string();
+        let ip_string = match self.seed {
+            Some(seed) => format!("{}|{}", seed, ip),
+            None => ip.to_string(),
+        };
         let digest = md5::compute(ip_string.as_bytes());
         let mut idx = (u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) as usize)
             % self.edge_ips.len();
@@ -628,7 +699,7 @@ impl AddressRewriter {
             return mapped_ipv4;
         }
 
-        let seed = Self::ipv6_seed(ip);
+        let seed = Self::ipv6_seed(ip, self.seed);
         let pool = prefer_other_of
             .and_then(|prefer| self.pool_for_preference(prefer))
             .unwrap_or_else(|| self.default_ipv6_pool());
@@ -701,11 +772,15 @@ impl AddressRewriter {
         })
     }
 
-    fn ipv6_seed(ip: Ipv6Addr) -> u32 {
-        let octets = ip.octets();
-        let md5_digest = md5::compute(octets);
+    fn ipv6_seed(ip: Ipv6Addr, salt: Option<u64>) -> u32 {
+        let mut octets: Vec<u8> = Vec::with_capacity(24);
+        if let Some(seed) = salt {
+            octets.extend_from_slice(&seed.to_be_bytes());
+        }
+        octets.extend_from_slice(&ip.octets());
+        let md5_digest = md5::compute(&octets);
         let mut sha1_hasher = Sha1::new();
-        sha1_hasher.update(octets);
+        sha1_hasher.update(&octets);
         let sha1_digest = sha1_hasher.finalize();
         let md5_part =
             u32::from_be_bytes([md5_digest[0], md5_digest[1], md5_digest[2], md5_digest[3]]);
@@ -765,6 +840,7 @@ fn rewrite_ipv6_packet_into(
     match next_header {
         IpNextHeaderProtocols::Udp | IpNextHeaderProtocols::Tcp => {
             guard_reserved_ports(&mut out[34..], next_header);
+            shift_ephemeral_ports(&mut out[34..], next_header, rewriter.port_offset);
             set_transport_checksum_ipv4(&mut out[34..], next_header, &mapped_src, &mapped_dst);
         }
         IpNextHeaderProtocols::Icmpv6 if payload_len >= 4 => {
@@ -878,7 +954,7 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
     let input_size = fs::metadata(&config.input)?.len();
     let mut capture = Capture::from_file(&config.input)?;
     let input_linktype = capture.get_datalink();
-    let mut address_rewriter = AddressRewriter::new(config.topology.as_deref());
+    let mut address_rewriter = AddressRewriter::with_seed(config.topology.as_deref(), config.seed);
 
     info!(
         "Starting rewrite | input={} size_bytes={} format={:?} linktype_in={:?}",
@@ -934,6 +1010,8 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 linktype_in: format!("{:?}", input_linktype),
                 linktype_out: format!("{:?}", input_linktype),
                 edge_hosts_used: Vec::new(),
+                seed: config.seed,
+                ephemeral_port_offset: config.seed.map(|_| address_rewriter.port_offset),
             },
             warnings: vec![
                 "Dry-run mode: output capture not written".to_string(),
@@ -1104,6 +1182,8 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
             linktype_in: format!("{:?}", input_linktype),
             linktype_out: format!("{:?}", output_linktype),
             edge_hosts_used: Vec::new(),
+            seed: config.seed,
+            ephemeral_port_offset: config.seed.map(|_| address_rewriter.port_offset),
         },
         warnings,
     };
@@ -1294,6 +1374,7 @@ mod tests {
             dry_run: true,
             progress_every: 0,
             max_packets: None,
+            seed: None,
         };
 
         run(cli)?;
@@ -1323,6 +1404,7 @@ mod tests {
             dry_run: false,
             progress_every: 0,
             max_packets: None,
+            seed: None,
         };
 
         run(cli)?;
@@ -1371,6 +1453,7 @@ mod tests {
             dry_run: false,
             progress_every: 0,
             max_packets: None,
+            seed: None,
         };
         run(cli)?;
         let output = tmp.path().join("badlen_rewritten.pcap");
@@ -1406,6 +1489,7 @@ mod tests {
             dry_run: false,
             progress_every: 0,
             max_packets: None,
+            seed: None,
         };
 
         run(cli)?;
@@ -1648,5 +1732,121 @@ mod tests {
             udp.get_checksum(),
             udp_ipv4_checksum(&udp, &ip.get_source(), &ip.get_destination())
         );
+    }
+
+    fn mapping_for(seed: Option<u64>, dir: &std::path::Path) -> Vec<Ipv4Addr> {
+        let mut rw = AddressRewriter::with_seed(Some(&topology_with_collectors(dir)), seed);
+        (0..64u32)
+            .map(|i| rw.map_ipv4_with_preference(Ipv4Addr::from(0xC633_6400u32 + i * 7), None))
+            .collect()
+    }
+
+    /// Step 2 of the variation plan (2026-10-30): the same capture lands on
+    /// different hosts per episode seed, reproducibly; no seed keeps the
+    /// unsalted mapping every earlier run used.
+    #[test]
+    fn a_seed_salts_the_mapping_reproducibly_and_none_keeps_the_old_one() {
+        let tmp = tempdir().unwrap();
+        let a1 = mapping_for(Some(1), tmp.path());
+        let a2 = mapping_for(Some(1), tmp.path());
+        let b = mapping_for(Some(2), tmp.path());
+        let none = mapping_for(None, tmp.path());
+        assert_eq!(a1, a2, "same seed, same mapping");
+        assert_ne!(a1, b, "different seeds move addresses");
+        // Unseeded: md5 of the address text, as before the seed existed.
+        let rw = AddressRewriter::new(Some(&topology_with_collectors(tmp.path())));
+        for (i, mapped) in none.iter().enumerate() {
+            let ip = Ipv4Addr::from(0xC633_6400u32 + i as u32 * 7);
+            let d = md5::compute(ip.to_string().as_bytes());
+            let idx = (u32::from_be_bytes([d[0], d[1], d[2], d[3]]) as usize) % rw.edge_ips.len();
+            assert_eq!(*mapped, rw.edge_ips[idx]);
+        }
+        for seed in 0..50u64 {
+            for m in mapping_for(Some(seed), tmp.path()) {
+                assert!(
+                    m.octets()[2] == 1 || m.octets()[2] == 5,
+                    "seed {} mapped onto {}",
+                    seed,
+                    m
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ephemeral_ports_shift_consistently_and_service_ports_stay() {
+        for seed in [1u64, 7, 99, 12345] {
+            let off = ephemeral_port_offset(seed);
+            assert!((1..32768).contains(&off));
+            let mut fwd = [0u8; 8];
+            fwd[0..2].copy_from_slice(&50000u16.to_be_bytes());
+            fwd[2..4].copy_from_slice(&443u16.to_be_bytes());
+            let mut rev = [0u8; 8];
+            rev[0..2].copy_from_slice(&443u16.to_be_bytes());
+            rev[2..4].copy_from_slice(&50000u16.to_be_bytes());
+            assert!(shift_ephemeral_ports(
+                &mut fwd,
+                IpNextHeaderProtocols::Tcp,
+                off
+            ));
+            assert!(shift_ephemeral_ports(
+                &mut rev,
+                IpNextHeaderProtocols::Tcp,
+                off
+            ));
+            let fwd_src = u16::from_be_bytes([fwd[0], fwd[1]]);
+            assert_eq!(
+                fwd_src,
+                u16::from_be_bytes([rev[2], rev[3]]),
+                "both directions agree"
+            );
+            assert!(fwd_src >= EPHEMERAL_PORT_FLOOR && fwd_src != 50000);
+            assert_eq!(
+                u16::from_be_bytes([fwd[2], fwd[3]]),
+                443,
+                "service port kept"
+            );
+        }
+        let mut udp = [0u8; 8];
+        udp[0..2].copy_from_slice(&65535u16.to_be_bytes());
+        shift_ephemeral_ports(&mut udp, IpNextHeaderProtocols::Udp, 1);
+        assert_eq!(
+            u16::from_be_bytes([udp[0], udp[1]]),
+            EPHEMERAL_PORT_FLOOR,
+            "wraps inside the range"
+        );
+        let mut icmp = [0u8; 8];
+        assert!(!shift_ephemeral_ports(
+            &mut icmp,
+            IpNextHeaderProtocols::Icmp,
+            5
+        ));
+    }
+
+    #[test]
+    fn the_manifest_records_the_seed_and_port_offset() -> Result<(), Box<dyn Error>> {
+        let tmp = tempdir()?;
+        let input = tmp.path().join("input.pcap");
+        fs::write(&input, minimal_pcap_with_packet()?)?;
+        let manifest = tmp.path().join("manifest.json");
+        let cli = RewriteCli {
+            input,
+            output: Some(tmp.path().join("out.pcap")),
+            manifest: Some(manifest.clone()),
+            topology: Some(topology_with_collectors(tmp.path())),
+            verbose: 0,
+            dry_run: false,
+            progress_every: 0,
+            max_packets: None,
+            seed: Some(42),
+        };
+        run(cli)?;
+        let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
+        assert_eq!(m["stats"]["seed"], 42);
+        assert_eq!(
+            m["stats"]["ephemeral_port_offset"],
+            u64::from(ephemeral_port_offset(42))
+        );
+        Ok(())
     }
 }
