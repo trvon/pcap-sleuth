@@ -67,11 +67,23 @@ pub struct RewriteCli {
     pub seed: Option<u64>,
 
     /// Keep only a window of this many capture-seconds (replayed at native
-    /// speed by the caller). The window start is a seed-derived fraction of
-    /// (duration - window), 0 without a seed; captures no longer than the
-    /// window are kept whole. Start and source duration go to the manifest.
+    /// speed by the caller). The window start is density-aware (>= min_density_ratio of
+    /// median rate, or densest, inside attack span if specified). Start, packets inside
+    /// window, and rule are recorded in the manifest.
     #[arg(long, value_name = "SECONDS")]
     pub window_seconds: Option<f64>,
+
+    /// Optional labelled attack start timestamp (seconds, relative or absolute).
+    #[arg(long, value_name = "SECONDS")]
+    pub attack_start: Option<f64>,
+
+    /// Optional labelled attack end timestamp (seconds, relative or absolute).
+    #[arg(long, value_name = "SECONDS")]
+    pub attack_end: Option<f64>,
+
+    /// Minimum window packet rate ratio relative to median rate (default 0.10)
+    #[arg(long, value_name = "RATIO", default_value_t = 0.10)]
+    pub min_density_ratio: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +97,9 @@ pub struct RewriteConfig {
     pub max_packets: Option<u64>,
     pub seed: Option<u64>,
     pub window_seconds: Option<f64>,
+    pub attack_start: Option<f64>,
+    pub attack_end: Option<f64>,
+    pub min_density_ratio: f64,
 }
 
 impl RewriteConfig {
@@ -104,6 +119,9 @@ impl RewriteConfig {
             max_packets: cli.max_packets,
             seed: cli.seed,
             window_seconds: cli.window_seconds,
+            attack_start: cli.attack_start,
+            attack_end: cli.attack_end,
+            min_density_ratio: cli.min_density_ratio,
         }
     }
 }
@@ -191,6 +209,10 @@ struct RewriteStats {
     source_duration_seconds: Option<f64>,
     /// Packets dropped because they fell outside the window.
     packets_outside_window: u64,
+    /// Packets inside the chosen window.
+    window_packets: Option<u64>,
+    /// Rule used to select the window (e.g. "density_aware", "densest_fallback", "whole_capture").
+    window_rule: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -461,44 +483,210 @@ fn guard_reserved_ports(transport: &mut [u8], protocol: IpNextHeaderProtocol) ->
     changed
 }
 
-/// Seed-derived fraction in [0, 1) placing the replay window.
-fn window_fraction(seed: Option<u64>) -> f64 {
-    match seed {
-        None => 0.0,
-        Some(seed) => {
-            let d = md5::compute(format!("window|{}", seed).as_bytes());
-            f64::from(u32::from_be_bytes([d[0], d[1], d[2], d[3]])) / (f64::from(u32::MAX) + 1.0)
-        }
-    }
+#[derive(Debug, Clone)]
+pub struct WindowSelection {
+    pub start_abs: f64,
+    pub end_abs: f64,
+    pub start_rel: f64,
+    pub window_packets: u64,
+    pub rule: String,
 }
 
-/// (min, max) packet timestamp of a capture, in seconds: one header-only pass.
-fn capture_span(path: &Path) -> Result<Option<(f64, f64)>, Box<dyn Error>> {
+#[derive(Debug, Clone)]
+pub struct CaptureDensityProfile {
+    pub lo: f64,
+    pub hi: f64,
+    pub total_packets: u64,
+    pub bin_size: f64,
+    pub bins: Vec<u32>,
+}
+
+/// Profile packet density across time: single header pass binning packet arrival rate.
+fn profile_capture_density(path: &Path) -> Result<Option<CaptureDensityProfile>, Box<dyn Error>> {
     let mut cap = Capture::from_file(path)?;
-    let mut span: Option<(f64, f64)> = None;
+    let mut lo: Option<f64> = None;
+    let mut hi: Option<f64> = None;
+    let mut total_packets = 0u64;
+    let mut bin_size = 1.0f64;
+    let mut bins: Vec<u32> = Vec::new();
+
     while let Ok(packet) = cap.next_packet() {
         let t = packet.header.ts.tv_sec as f64 + packet.header.ts.tv_usec as f64 / 1_000_000.0;
-        span = Some(match span {
-            None => (t, t),
-            Some((lo, hi)) => (lo.min(t), hi.max(t)),
-        });
+        // Ignore uninitialized or invalid epoch timestamps
+        if t < 0.0 || t > 2_500_000_000.0 {
+            continue;
+        }
+        total_packets += 1;
+        let t_lo = *lo.get_or_insert(t);
+        let cur_hi = hi.get_or_insert(t);
+        if t < t_lo {
+            lo = Some(t);
+        }
+        if t > *cur_hi {
+            *cur_hi = t;
+        }
+
+        let mut offset = t - t_lo;
+        if offset < 0.0 {
+            offset = 0.0;
+        }
+        let mut idx = (offset / bin_size) as usize;
+
+        // Cap bin count at 500,000 to bound memory (< 2 MB) even for multi-day captures
+        while idx >= 500_000 {
+            let mut new_bins = Vec::with_capacity((bins.len() + 1) / 2);
+            for chunk in bins.chunks(2) {
+                new_bins.push(chunk.iter().sum());
+            }
+            bins = new_bins;
+            bin_size *= 2.0;
+            idx = (offset / bin_size) as usize;
+        }
+
+        if idx >= bins.len() {
+            bins.resize(idx + 1, 0);
+        }
+        bins[idx] = bins[idx].saturating_add(1);
     }
-    Ok(span)
+
+    match (lo, hi) {
+        (Some(lo), Some(hi)) => Ok(Some(CaptureDensityProfile {
+            lo,
+            hi,
+            total_packets,
+            bin_size,
+            bins,
+        })),
+        _ => Ok(None),
+    }
 }
 
-/// The kept window [start, end) in absolute seconds, or None to keep everything.
-fn replay_window(
-    span: Option<(f64, f64)>,
-    window: f64,
+/// Density-aware window selection: never selects an empty window.
+/// Picks among windows holding >= min_density_ratio * median packet rate (or densest),
+/// inside a labelled attack span when provided.
+fn select_density_aware_window(
+    profile: &CaptureDensityProfile,
+    window_s: f64,
     seed: Option<u64>,
-) -> Option<(f64, f64, f64)> {
-    let (lo, hi) = span?;
-    let duration = hi - lo;
-    if window <= 0.0 || duration <= window {
+    attack_span: Option<(f64, f64)>,
+    min_density_ratio: f64,
+) -> Option<WindowSelection> {
+    if window_s <= 0.0 || profile.total_packets == 0 {
         return None;
     }
-    let start = window_fraction(seed) * (duration - window);
-    Some((lo + start, lo + start + window, start))
+    let duration = profile.hi - profile.lo;
+    if duration <= window_s {
+        return Some(WindowSelection {
+            start_abs: profile.lo,
+            end_abs: profile.lo + window_s,
+            start_rel: 0.0,
+            window_packets: profile.total_packets,
+            rule: "whole_capture".to_string(),
+        });
+    }
+
+    let b_count = ((window_s / profile.bin_size).round() as usize).max(1);
+    if profile.bins.len() <= b_count {
+        return Some(WindowSelection {
+            start_abs: profile.lo,
+            end_abs: profile.lo + window_s,
+            start_rel: 0.0,
+            window_packets: profile.total_packets,
+            rule: "whole_capture".to_string(),
+        });
+    }
+
+    let num_candidates = profile.bins.len() - b_count + 1;
+    let mut candidate_counts: Vec<u64> = Vec::with_capacity(num_candidates);
+    let mut cur_sum: u64 = profile.bins[..b_count].iter().map(|&c| c as u64).sum();
+    candidate_counts.push(cur_sum);
+    for i in 1..num_candidates {
+        cur_sum = cur_sum - (profile.bins[i - 1] as u64) + (profile.bins[i + b_count - 1] as u64);
+        candidate_counts.push(cur_sum);
+    }
+
+    let max_count = *candidate_counts.iter().max().unwrap_or(&0);
+    if max_count == 0 {
+        return Some(WindowSelection {
+            start_abs: profile.lo,
+            end_abs: profile.lo + window_s,
+            start_rel: 0.0,
+            window_packets: 0,
+            rule: "zero_packets".to_string(),
+        });
+    }
+
+    let mut non_zero_counts: Vec<u64> = candidate_counts.iter().copied().filter(|&c| c > 0).collect();
+    non_zero_counts.sort_unstable();
+    let median_count = if non_zero_counts.is_empty() {
+        1u64
+    } else {
+        non_zero_counts[non_zero_counts.len() / 2]
+    };
+
+    let threshold = ((median_count as f64) * min_density_ratio).max(1.0).floor() as u64;
+
+    let is_in_attack_span = |idx: usize| -> bool {
+        if let Some((att_lo, att_hi)) = attack_span {
+            let win_start = profile.lo + (idx as f64) * profile.bin_size;
+            let win_end = win_start + window_s;
+            win_start < att_hi && win_end > att_lo
+        } else {
+            true
+        }
+    };
+
+    let mut eligible: Vec<usize> = (0..num_candidates)
+        .filter(|&i| candidate_counts[i] >= threshold && is_in_attack_span(i))
+        .collect();
+    let mut rule = if attack_span.is_some() {
+        "density_aware_attack_span".to_string()
+    } else {
+        "density_aware".to_string()
+    };
+
+    if eligible.is_empty() && attack_span.is_some() {
+        let in_span: Vec<usize> = (0..num_candidates)
+            .filter(|&i| is_in_attack_span(i) && candidate_counts[i] > 0)
+            .collect();
+        if !in_span.is_empty() {
+            let max_span = in_span.iter().map(|&i| candidate_counts[i]).max().unwrap();
+            eligible = in_span.into_iter().filter(|&i| candidate_counts[i] == max_span).collect();
+            rule = "densest_attack_span".to_string();
+        }
+    }
+
+    if eligible.is_empty() {
+        eligible = (0..num_candidates).filter(|&i| candidate_counts[i] >= threshold).collect();
+        rule = "density_aware".to_string();
+    }
+
+    if eligible.is_empty() {
+        eligible = (0..num_candidates).filter(|&i| candidate_counts[i] == max_count).collect();
+        rule = "densest_fallback".to_string();
+    }
+
+    let selected_idx = match seed {
+        None => eligible[0],
+        Some(s) => {
+            let digest = md5::compute(format!("density_window|{}|{}", s, eligible.len()).as_bytes());
+            let val = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) as usize;
+            eligible[val % eligible.len()]
+        }
+    };
+
+    let start_rel = (selected_idx as f64) * profile.bin_size;
+    let start_abs = profile.lo + start_rel;
+    let end_abs = start_abs + window_s;
+    let window_packets = candidate_counts[selected_idx];
+
+    Some(WindowSelection {
+        start_abs,
+        end_abs,
+        start_rel,
+        window_packets,
+        rule,
+    })
 }
 
 /// First ephemeral port that the variation seed shifts (IANA dynamic range
@@ -1073,6 +1261,8 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 window_start_seconds: None,
                 source_duration_seconds: None,
                 packets_outside_window: 0,
+                window_packets: None,
+                window_rule: None,
             },
             warnings: vec![
                 "Dry-run mode: output capture not written".to_string(),
@@ -1097,13 +1287,20 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
     }
     let mut writer = PcapWriter::create(&config.output, output_linktype)?;
 
-    let span = match config.window_seconds {
-        Some(_) => capture_span(&config.input)?,
+    let profile = match config.window_seconds {
+        Some(_) => profile_capture_density(&config.input)?,
         None => None,
     };
-    let window = config
-        .window_seconds
-        .and_then(|w| replay_window(span, w, config.seed));
+    let window_sel = config.window_seconds.and_then(|w| {
+        profile.as_ref().and_then(|p| {
+            let attack_span = config.attack_start.zip(config.attack_end).map(|(s, e)| {
+                let a_lo = if s < p.lo { p.lo + s } else { s };
+                let a_hi = if e < p.lo { p.lo + e } else { e };
+                (a_lo, a_hi)
+            });
+            select_density_aware_window(p, w, config.seed, attack_span, config.min_density_ratio)
+        })
+    });
     let mut packets_outside_window = 0_u64;
 
     let mut packets_total = 0_u64;
@@ -1126,8 +1323,8 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 packets_total += 1;
                 let timestamp =
                     packet.header.ts.tv_sec as f64 + packet.header.ts.tv_usec as f64 / 1_000_000.0;
-                if let Some((lo, hi, _)) = window
-                    && (timestamp < lo || timestamp >= hi)
+                if let Some(ref sel) = window_sel
+                    && (timestamp < sel.start_abs || timestamp >= sel.end_abs)
                 {
                     packets_outside_window += 1;
                     continue;
@@ -1261,9 +1458,11 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
             seed: config.seed,
             ephemeral_port_offset: config.seed.map(|_| address_rewriter.port_offset),
             window_seconds: config.window_seconds,
-            window_start_seconds: window.map(|w| w.2).or(config.window_seconds.map(|_| 0.0)),
-            source_duration_seconds: span.map(|(lo, hi)| hi - lo),
+            window_start_seconds: window_sel.as_ref().map(|s| s.start_rel).or(config.window_seconds.map(|_| 0.0)),
+            source_duration_seconds: profile.as_ref().map(|p| p.hi - p.lo),
             packets_outside_window,
+            window_packets: window_sel.as_ref().map(|s| s.window_packets),
+            window_rule: window_sel.as_ref().map(|s| s.rule.clone()),
         },
         warnings,
     };
@@ -1456,6 +1655,9 @@ mod tests {
             max_packets: None,
             seed: None,
             window_seconds: None,
+            attack_start: None,
+            attack_end: None,
+            min_density_ratio: 0.10,
         };
 
         run(cli)?;
@@ -1487,6 +1689,9 @@ mod tests {
             max_packets: None,
             seed: None,
             window_seconds: None,
+            attack_start: None,
+            attack_end: None,
+            min_density_ratio: 0.10,
         };
 
         run(cli)?;
@@ -1537,6 +1742,9 @@ mod tests {
             max_packets: None,
             seed: None,
             window_seconds: None,
+            attack_start: None,
+            attack_end: None,
+            min_density_ratio: 0.10,
         };
         run(cli)?;
         let output = tmp.path().join("badlen_rewritten.pcap");
@@ -1574,6 +1782,9 @@ mod tests {
             max_packets: None,
             seed: None,
             window_seconds: None,
+            attack_start: None,
+            attack_end: None,
+            min_density_ratio: 0.10,
         };
 
         run(cli)?;
@@ -1924,6 +2135,9 @@ mod tests {
             max_packets: None,
             seed: Some(42),
             window_seconds: None,
+            attack_start: None,
+            attack_end: None,
+            min_density_ratio: 0.10,
         };
         run(cli)?;
         let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
@@ -1970,6 +2184,9 @@ mod tests {
             max_packets: None,
             seed,
             window_seconds: Some(window),
+            attack_start: None,
+            attack_end: None,
+            min_density_ratio: 0.10,
         })?;
         let mut m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
         let mut cap = Capture::from_file(tmp.path().join("out.pcap"))?;
@@ -2017,6 +2234,78 @@ mod tests {
         assert_eq!(m["kept"], 5);
         assert_eq!(m["stats"]["packets_outside_window"], 0);
         assert_eq!(m["stats"]["window_start_seconds"], 0.0);
+        assert_eq!(m["stats"]["window_packets"], 5);
+        assert_eq!(m["stats"]["window_rule"], "whole_capture");
+        Ok(())
+    }
+
+    #[test]
+    fn density_aware_window_never_picks_empty_windows() -> Result<(), Box<dyn Error>> {
+        let tmp = tempdir()?;
+        let input = tmp.path().join("deadzone.pcap");
+        // Create a pcap with 50s deadzone (0 packets) followed by 20 packets from t=1050 to t=1069
+        let one = minimal_pcap_with_packet()?;
+        let frame = &one[24 + 16..];
+        let mut bytes = minimal_pcap_header();
+        for t in 50u32..70u32 {
+            bytes.extend_from_slice(&(1_000u32 + t).to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(frame);
+        }
+        fs::write(&input, bytes)?;
+        let manifest = tmp.path().join("m.json");
+        run(RewriteCli {
+            input,
+            output: Some(tmp.path().join("out.pcap")),
+            manifest: Some(manifest.clone()),
+            topology: Some(topology_with_collectors(tmp.path())),
+            verbose: 0,
+            dry_run: false,
+            progress_every: 0,
+            max_packets: None,
+            seed: Some(12345),
+            window_seconds: Some(10.0),
+            attack_start: None,
+            attack_end: None,
+            min_density_ratio: 0.10,
+        })?;
+        let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
+        let kept = m["stats"]["window_packets"].as_u64().unwrap();
+        assert!(kept > 0, "density-aware window must never select 0 packets");
+        let rule = m["stats"]["window_rule"].as_str().unwrap();
+        assert!(rule.contains("density_aware") || rule.contains("densest"));
+        Ok(())
+    }
+
+    #[test]
+    fn density_aware_respects_attack_span() -> Result<(), Box<dyn Error>> {
+        let tmp = tempdir()?;
+        let input = tmp.path().join("attack_span.pcap");
+        // Packets from t=1000 to t=1100 (1 pkt/sec)
+        fs::write(&input, timed_pcap(100)?)?;
+        let manifest = tmp.path().join("m.json");
+        run(RewriteCli {
+            input,
+            output: Some(tmp.path().join("out.pcap")),
+            manifest: Some(manifest.clone()),
+            topology: Some(topology_with_collectors(tmp.path())),
+            verbose: 0,
+            dry_run: false,
+            progress_every: 0,
+            max_packets: None,
+            seed: Some(999),
+            window_seconds: Some(10.0),
+            attack_start: Some(1040.0),
+            attack_end: Some(1060.0),
+            min_density_ratio: 0.10,
+        })?;
+        let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
+        let start = m["stats"]["window_start_seconds"].as_f64().unwrap();
+        // Capture start is 1000. Window start relative to 1000 should overlap [40, 60]
+        assert!(start + 10.0 > 40.0 && start < 60.0, "window must overlap attack span");
+        assert_eq!(m["stats"]["window_rule"], "density_aware_attack_span");
         Ok(())
     }
 }
