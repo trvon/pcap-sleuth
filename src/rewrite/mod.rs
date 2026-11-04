@@ -804,6 +804,7 @@ fn select_density_aware_window(
     seed: Option<u64>,
     attack_span: Option<(f64, f64)>,
     min_density_ratio: f64,
+    flow_starts: Option<&[f64]>,
 ) -> Option<WindowSelection> {
     if window_s <= 0.0 || profile.total_packets == 0 {
         return None;
@@ -839,7 +840,44 @@ fn select_density_aware_window(
         candidate_counts.push(cur_sum);
     }
 
-    let max_count = *candidate_counts.iter().max().unwrap_or(&0);
+    // Flow-start anchoring: only windows that contain at least one flow start are candidates.
+    // With fewer than two such windows there is no density choice to make, so the window is
+    // anchored at the capture's first flow start.
+    let allowed: Vec<bool> = match flow_starts {
+        Some(starts) if !starts.is_empty() => (0..num_candidates)
+            .map(|i| {
+                let ws = profile.lo + (i as f64) * profile.bin_size;
+                let we = ws + window_s;
+                let k = starts.partition_point(|&t| t < ws);
+                k < starts.len() && starts[k] < we
+            })
+            .collect(),
+        _ => vec![true; num_candidates],
+    };
+    if let Some(starts) = flow_starts
+        && !starts.is_empty()
+        && allowed.iter().filter(|&&a| a).count() <= 1
+    {
+        let first = starts[0];
+        let i0 = (((first - profile.lo) / profile.bin_size).floor().max(0.0) as usize)
+            .min(profile.bins.len());
+        let i1 = (i0 + b_count).min(profile.bins.len());
+        let window_packets: u64 = profile.bins[i0..i1].iter().map(|&c| c as u64).sum();
+        return Some(WindowSelection {
+            start_abs: first,
+            end_abs: first + window_s,
+            start_rel: first - profile.lo,
+            window_packets,
+            rule: "first_flow_start".to_string(),
+        });
+    }
+    let anchored = flow_starts.is_some_and(|s| !s.is_empty());
+
+    let max_count = (0..num_candidates)
+        .filter(|&i| allowed[i])
+        .map(|i| candidate_counts[i])
+        .max()
+        .unwrap_or(0);
     if max_count == 0 {
         return Some(WindowSelection {
             start_abs: profile.lo,
@@ -875,7 +913,7 @@ fn select_density_aware_window(
     };
 
     let mut eligible: Vec<usize> = (0..num_candidates)
-        .filter(|&i| candidate_counts[i] >= threshold && is_in_attack_span(i))
+        .filter(|&i| allowed[i] && candidate_counts[i] >= threshold && is_in_attack_span(i))
         .collect();
     let mut rule = if attack_span.is_some() {
         "density_aware_attack_span".to_string()
@@ -885,7 +923,7 @@ fn select_density_aware_window(
 
     if eligible.is_empty() && attack_span.is_some() {
         let in_span: Vec<usize> = (0..num_candidates)
-            .filter(|&i| is_in_attack_span(i) && candidate_counts[i] > 0)
+            .filter(|&i| allowed[i] && is_in_attack_span(i) && candidate_counts[i] > 0)
             .collect();
         if !in_span.is_empty() {
             let max_span = in_span.iter().map(|&i| candidate_counts[i]).max().unwrap();
@@ -899,16 +937,23 @@ fn select_density_aware_window(
 
     if eligible.is_empty() {
         eligible = (0..num_candidates)
-            .filter(|&i| candidate_counts[i] >= threshold)
+            .filter(|&i| allowed[i] && candidate_counts[i] >= threshold)
             .collect();
         rule = "density_aware".to_string();
     }
 
     if eligible.is_empty() {
         eligible = (0..num_candidates)
-            .filter(|&i| candidate_counts[i] == max_count)
+            .filter(|&i| allowed[i] && candidate_counts[i] == max_count)
             .collect();
         rule = "densest_fallback".to_string();
+    }
+    if anchored {
+        rule = match rule.as_str() {
+            "density_aware" => "flow_start_density".to_string(),
+            "density_aware_attack_span" => "flow_start_density_attack_span".to_string(),
+            _ => rule,
+        };
     }
 
     let selected_idx = match seed {
@@ -1543,6 +1588,19 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
         Some(_) => profile_capture_density(&config.input)?,
         None => None,
     };
+    let flow_first = if config.window_seconds.is_some()
+        && profile.is_some()
+        && config.window_anchor == WindowAnchor::FlowStart
+    {
+        Some(flow_first_seen(&config.input)?)
+    } else {
+        None
+    };
+    let mut flow_starts: Vec<f64> = flow_first
+        .as_ref()
+        .map(|m| m.values().copied().collect())
+        .unwrap_or_default();
+    flow_starts.sort_by(|a, b| a.total_cmp(b));
     let window_sel = config.window_seconds.and_then(|w| {
         profile.as_ref().and_then(|p| {
             let attack_span = config.attack_start.zip(config.attack_end).map(|(s, e)| {
@@ -1550,15 +1608,22 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 let a_hi = if e < p.lo { p.lo + e } else { e };
                 (a_lo, a_hi)
             });
-            select_density_aware_window(p, w, config.seed, attack_span, config.min_density_ratio)
-                .map(|sel| widen_window(p, sel, config.min_window_packets))
+            let starts = if flow_starts.is_empty() {
+                None
+            } else {
+                Some(flow_starts.as_slice())
+            };
+            select_density_aware_window(
+                p,
+                w,
+                config.seed,
+                attack_span,
+                config.min_density_ratio,
+                starts,
+            )
+            .map(|sel| widen_window(p, sel, config.min_window_packets))
         })
     });
-    let flow_first = if window_sel.is_some() && config.window_anchor == WindowAnchor::FlowStart {
-        Some(flow_first_seen(&config.input)?)
-    } else {
-        None
-    };
     let mut kept_flows: HashSet<FlowKey> = HashSet::new();
     let mut dropped_flows: HashSet<FlowKey> = HashSet::new();
     let mut packets_dropped_partial = 0_u64;
@@ -1736,6 +1801,14 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 break;
             }
         }
+    }
+
+    if flow_first.as_ref().is_some_and(|m| !m.is_empty()) && last_out_timestamp.is_none() {
+        return Err(format!(
+            "flow-start anchored window kept no packets although the input has {} IP flows",
+            flow_first.as_ref().map_or(0, |m| m.len())
+        )
+        .into());
     }
 
     if loop_buffering && !loop_buf.is_empty() {
@@ -2862,6 +2935,45 @@ mod tests {
         assert_eq!(mt["stats"]["window_anchor"], "time");
         assert!(tt.len() > 3);
         assert_eq!(mt["stats"]["flows_dropped_partial"], 0);
+        Ok(())
+    }
+
+    #[test]
+    fn one_long_flow_starting_at_t0_anchors_at_its_start_and_is_not_empty()
+    -> Result<(), Box<dyn Error>> {
+        let pkts: Vec<(u32, u32, u16)> = (0..100).map(|t| (1_000 + t, 0, 1111)).collect();
+        let (m, ts) = run_flows(&pkts, 10.0, None, WindowAnchor::FlowStart, false)?;
+        assert_eq!(m["stats"]["window_rule"], "first_flow_start");
+        assert_eq!(m["stats"]["window_start_seconds"], 0.0);
+        assert!(!ts.is_empty(), "output empty");
+        assert!(ts.len() >= 10, "kept {ts:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_densest_region_of_continuing_flows_is_skipped_for_a_window_with_a_flow_start()
+    -> Result<(), Box<dyn Error>> {
+        // Flow 1111 starts at t=0 and is sparse, then dense in 60..70; flows 2222 and 3333 start
+        // at t=20 and t=30 with one packet each. The densest window (60..70) holds no start.
+        let mut pkts: Vec<(u32, u32, u16)> = (0..100).map(|t| (1_000 + t, 0, 1111)).collect();
+        for t in 60..70 {
+            for k in 1..10 {
+                pkts.push((1_000 + t, k * 100_000, 1111));
+            }
+        }
+        pkts.push((1_020, 500_000, 2222));
+        pkts.push((1_030, 500_000, 3333));
+        pkts.sort();
+        let (m, ts) = run_flows(&pkts, 10.0, None, WindowAnchor::FlowStart, false)?;
+        let start = m["stats"]["window_start_seconds"].as_f64().unwrap();
+        assert!(
+            (start <= 20.5 && 20.5 < start + 10.0)
+                || (start <= 30.5 && 30.5 < start + 10.0)
+                || start == 0.0,
+            "window start {start} holds no flow start"
+        );
+        assert!(!ts.is_empty(), "output empty");
+        assert!(m["stats"]["flows_kept"].as_u64().unwrap() >= 1);
         Ok(())
     }
 
