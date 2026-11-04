@@ -95,6 +95,33 @@ pub struct RewriteCli {
     /// (capped at 1000 passes). Default on; only acts when --window-seconds is set.
     #[arg(long, value_name = "BOOL", default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub loop_fill: bool,
+
+    /// How a window selects packets. `flow-start` (default) keeps only packets of flows whose
+    /// first packet in the capture lies inside the window (so handshakes are present);
+    /// `time` keeps every packet whose timestamp lies inside the window.
+    #[arg(long, value_enum, default_value = "flow-start")]
+    pub window_anchor: WindowAnchor,
+
+    /// With `--window-anchor flow-start`: packets of kept flows are retained up to this many
+    /// seconds past the window end (default 5).
+    #[arg(long, value_name = "SECONDS", default_value_t = 5.0)]
+    pub flow_grace_seconds: f64,
+}
+
+/// Window packet-selection rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum WindowAnchor {
+    FlowStart,
+    Time,
+}
+
+impl WindowAnchor {
+    fn name(self) -> &'static str {
+        match self {
+            WindowAnchor::FlowStart => "flow_start",
+            WindowAnchor::Time => "time",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +140,8 @@ pub struct RewriteConfig {
     pub min_density_ratio: f64,
     pub min_window_packets: u64,
     pub loop_fill: bool,
+    pub window_anchor: WindowAnchor,
+    pub flow_grace_seconds: f64,
 }
 
 impl RewriteConfig {
@@ -137,6 +166,8 @@ impl RewriteConfig {
             min_density_ratio: cli.min_density_ratio,
             min_window_packets: cli.min_window_packets,
             loop_fill: cli.loop_fill,
+            window_anchor: cli.window_anchor,
+            flow_grace_seconds: cli.flow_grace_seconds,
         }
     }
 }
@@ -232,6 +263,90 @@ struct RewriteStats {
     loop_passes: u64,
     /// Span (first to last packet) of the emitted output, seconds.
     output_span_seconds: Option<f64>,
+    /// Window packet-selection rule in force ("flow_start" or "time"), when windowing.
+    window_anchor: Option<String>,
+    /// Distinct flows with at least one packet written (flow-start anchoring only).
+    flows_kept: u64,
+    /// Distinct flows dropped because they began before the window.
+    flows_dropped_partial: u64,
+    /// Packets of those flows that fell inside the window's time range.
+    packets_dropped_partial: u64,
+}
+
+/// Bidirectional flow key: protocol plus the unordered pair of (address, port) endpoints.
+type FlowKey = (u8, ([u8; 16], u16), ([u8; 16], u16));
+
+/// Flow key of a raw frame (Ethernet, optionally 802.1Q, or Linux cooked); None for non-IP.
+fn flow_key(linktype: Linktype, data: &[u8]) -> Option<FlowKey> {
+    let (mut off, mut ethertype) = if linktype == Linktype(113) {
+        if data.len() < 16 {
+            return None;
+        }
+        (16, u16::from_be_bytes([data[14], data[15]]))
+    } else {
+        if data.len() < 14 {
+            return None;
+        }
+        (14, u16::from_be_bytes([data[12], data[13]]))
+    };
+    while (ethertype == 0x8100 || ethertype == 0x88a8) && data.len() >= off + 4 {
+        ethertype = u16::from_be_bytes([data[off + 2], data[off + 3]]);
+        off += 4;
+    }
+    let ip = data.get(off..)?;
+    let (proto, src, dst, l4): (u8, [u8; 16], [u8; 16], Option<&[u8]>) = match ethertype {
+        0x0800 => {
+            if ip.len() < 20 || ip[0] >> 4 != 4 {
+                return None;
+            }
+            let ihl = ((ip[0] & 0x0f) as usize) * 4;
+            let mut s = [0u8; 16];
+            let mut d = [0u8; 16];
+            s[..4].copy_from_slice(&ip[12..16]);
+            d[..4].copy_from_slice(&ip[16..20]);
+            let frag = u16::from_be_bytes([ip[6], ip[7]]) & 0x1fff;
+            let l4 = if frag == 0 { ip.get(ihl..) } else { None };
+            (ip[9], s, d, l4)
+        }
+        0x86dd => {
+            if ip.len() < 40 || ip[0] >> 4 != 6 {
+                return None;
+            }
+            let mut s = [0u8; 16];
+            let mut d = [0u8; 16];
+            s.copy_from_slice(&ip[8..24]);
+            d.copy_from_slice(&ip[24..40]);
+            (ip[6], s, d, ip.get(40..))
+        }
+        _ => return None,
+    };
+    let (sp, dp) = match (proto, l4) {
+        (6 | 17, Some(l4)) if l4.len() >= 4 => (
+            u16::from_be_bytes([l4[0], l4[1]]),
+            u16::from_be_bytes([l4[2], l4[3]]),
+        ),
+        _ => (0, 0),
+    };
+    let a = (src, sp);
+    let b = (dst, dp);
+    Some(if a <= b { (proto, a, b) } else { (proto, b, a) })
+}
+
+/// Timestamp of the first packet of every IP flow in the capture.
+fn flow_first_seen(path: &Path) -> Result<HashMap<FlowKey, f64>, Box<dyn Error>> {
+    let mut cap = Capture::from_file(path)?;
+    let linktype = cap.get_datalink();
+    let mut first: HashMap<FlowKey, f64> = HashMap::new();
+    while let Ok(packet) = cap.next_packet() {
+        let t = packet.header.ts.tv_sec as f64 + packet.header.ts.tv_usec as f64 / 1_000_000.0;
+        if let Some(k) = flow_key(linktype, packet.data) {
+            let e = first.entry(k).or_insert(t);
+            if t < *e {
+                *e = t;
+            }
+        }
+    }
+    Ok(first)
 }
 
 fn header_micros(h: &pcap::PacketHeader) -> i64 {
@@ -260,7 +375,12 @@ fn emit_loop_passes(
     } else {
         gaps[gaps.len() / 2]
     };
-    let shift = (pass_span + median_gap).max(1_000);
+    // A pass whose packets share one timestamp has span 0; without a floor every pass would
+    // stack at one instant.
+    let min_shift = (10_000.0_f64)
+        .max(target_span * 1_000_000.0 / (buf.len().max(1) as f64))
+        .ceil() as i64;
+    let shift = (pass_span + median_gap).max(min_shift);
     let target_us = (target_span * 1_000_000.0).ceil() as i64;
     let mut passes = 1_u64;
     let mut last = t_last;
@@ -1383,6 +1503,10 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 edge_hosts_used: Vec::new(),
                 seed: config.seed,
                 ephemeral_port_offset: config.seed.map(|_| address_rewriter.port_offset),
+                window_anchor: None,
+                flows_kept: 0,
+                flows_dropped_partial: 0,
+                packets_dropped_partial: 0,
                 window_seconds: None,
                 window_start_seconds: None,
                 source_duration_seconds: None,
@@ -1430,6 +1554,14 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 .map(|sel| widen_window(p, sel, config.min_window_packets))
         })
     });
+    let flow_first = if window_sel.is_some() && config.window_anchor == WindowAnchor::FlowStart {
+        Some(flow_first_seen(&config.input)?)
+    } else {
+        None
+    };
+    let mut kept_flows: HashSet<FlowKey> = HashSet::new();
+    let mut dropped_flows: HashSet<FlowKey> = HashSet::new();
+    let mut packets_dropped_partial = 0_u64;
     let loop_enabled = config.loop_fill && window_sel.is_some();
     let target_span = config.window_seconds.unwrap_or(0.0);
     // Processed records of the first pass, kept only while the pass is still shorter than
@@ -1460,11 +1592,33 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 packets_total += 1;
                 let timestamp =
                     packet.header.ts.tv_sec as f64 + packet.header.ts.tv_usec as f64 / 1_000_000.0;
-                if let Some(ref sel) = window_sel
-                    && (timestamp < sel.start_abs || timestamp >= sel.end_abs)
-                {
-                    packets_outside_window += 1;
-                    continue;
+                if let Some(ref sel) = window_sel {
+                    let key = flow_first
+                        .as_ref()
+                        .and_then(|_| flow_key(input_linktype, packet.data));
+                    match (key, flow_first.as_ref()) {
+                        (Some(k), Some(first)) => {
+                            if timestamp < sel.start_abs
+                                || timestamp >= sel.end_abs + config.flow_grace_seconds
+                            {
+                                packets_outside_window += 1;
+                                continue;
+                            }
+                            let f = first.get(&k).copied().unwrap_or(timestamp);
+                            if f < sel.start_abs || f >= sel.end_abs {
+                                packets_dropped_partial += 1;
+                                dropped_flows.insert(k);
+                                continue;
+                            }
+                            kept_flows.insert(k);
+                        }
+                        _ => {
+                            if timestamp < sel.start_abs || timestamp >= sel.end_abs {
+                                packets_outside_window += 1;
+                                continue;
+                            }
+                        }
+                    }
                 }
                 first_timestamp.get_or_insert(timestamp);
                 last_timestamp = Some(timestamp);
@@ -1624,6 +1778,12 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
             output_span_seconds: first_timestamp
                 .zip(last_out_timestamp)
                 .map(|(first, last)| (last - first).max(0.0)),
+            window_anchor: window_sel
+                .as_ref()
+                .map(|_| config.window_anchor.name().to_string()),
+            flows_kept: kept_flows.len() as u64,
+            flows_dropped_partial: dropped_flows.len() as u64,
+            packets_dropped_partial,
         },
         warnings,
     };
@@ -1821,6 +1981,8 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill: false,
+            window_anchor: WindowAnchor::Time,
+            flow_grace_seconds: 5.0,
         };
 
         run(cli)?;
@@ -1857,6 +2019,8 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill: false,
+            window_anchor: WindowAnchor::Time,
+            flow_grace_seconds: 5.0,
         };
 
         run(cli)?;
@@ -1912,6 +2076,8 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill: false,
+            window_anchor: WindowAnchor::Time,
+            flow_grace_seconds: 5.0,
         };
         run(cli)?;
         let output = tmp.path().join("badlen_rewritten.pcap");
@@ -1954,6 +2120,8 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill: false,
+            window_anchor: WindowAnchor::Time,
+            flow_grace_seconds: 5.0,
         };
 
         run(cli)?;
@@ -2309,6 +2477,8 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill: false,
+            window_anchor: WindowAnchor::Time,
+            flow_grace_seconds: 5.0,
         };
         run(cli)?;
         let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
@@ -2360,6 +2530,8 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill: false,
+            window_anchor: WindowAnchor::Time,
+            flow_grace_seconds: 5.0,
         })?;
         let mut m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
         let mut cap = Capture::from_file(tmp.path().join("out.pcap"))?;
@@ -2445,6 +2617,8 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill: false,
+            window_anchor: WindowAnchor::Time,
+            flow_grace_seconds: 5.0,
         })?;
         let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
         let kept = m["stats"]["window_packets"].as_u64().unwrap();
@@ -2477,6 +2651,8 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill: false,
+            window_anchor: WindowAnchor::Time,
+            flow_grace_seconds: 5.0,
         })?;
         let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
         let start = m["stats"]["window_start_seconds"].as_f64().unwrap();
@@ -2530,6 +2706,8 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: min_packets,
             loop_fill,
+            window_anchor: WindowAnchor::Time,
+            flow_grace_seconds: 5.0,
         })?;
         let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
         let mut cap = Capture::from_file(tmp.path().join("out.pcap"))?;
@@ -2554,8 +2732,8 @@ mod tests {
             assert_eq!(pass[1] - pass[0], 50_000, "within-pass gap kept");
             assert_eq!(pass[2] - pass[1], 50_000, "within-pass gap kept");
         }
-        // pass shift = pass span (0.1 s) + median gap (0.05 s)
-        assert_eq!(ts[3] - ts[0], 150_000);
+        // pass shift = max(pass span 0.1 s + median gap 0.05 s, min shift W / packets = 10 s)
+        assert_eq!(ts[3] - ts[0], 10_000_000);
         let (off, ts_off) = windowed_at(&times, 30.0, 0, false)?;
         assert_eq!(off["stats"]["loop_passes"], 1);
         assert_eq!(ts_off.len(), 3);
@@ -2589,6 +2767,114 @@ mod tests {
         assert_eq!(m["stats"]["window_packets"], 100);
         assert_ne!(m["stats"]["window_rule"], "widened");
         assert_eq!(ts.len(), 100);
+        Ok(())
+    }
+
+    /// Capture with packets (sec, usec, source port); every packet is the minimal UDP frame with
+    /// its source port patched, so each distinct port is its own flow.
+    fn pcap_flows(pkts: &[(u32, u32, u16)]) -> Result<Vec<u8>, Box<dyn Error>> {
+        let one = minimal_pcap_with_packet()?;
+        let frame = &one[24 + 16..];
+        let mut bytes = minimal_pcap_header();
+        for (s, us, sport) in pkts {
+            let mut f = frame.to_vec();
+            f[34..36].copy_from_slice(&sport.to_be_bytes());
+            bytes.extend_from_slice(&s.to_le_bytes());
+            bytes.extend_from_slice(&us.to_le_bytes());
+            bytes.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&f);
+        }
+        Ok(bytes)
+    }
+
+    fn run_flows(
+        pkts: &[(u32, u32, u16)],
+        window: f64,
+        attack: Option<(f64, f64)>,
+        anchor: WindowAnchor,
+        loop_fill: bool,
+    ) -> Result<(serde_json::Value, Vec<i64>), Box<dyn Error>> {
+        let tmp = tempdir()?;
+        let input = tmp.path().join("in.pcap");
+        fs::write(&input, pcap_flows(pkts)?)?;
+        let manifest = tmp.path().join("m.json");
+        run(RewriteCli {
+            input,
+            output: Some(tmp.path().join("out.pcap")),
+            manifest: Some(manifest.clone()),
+            topology: Some(topology_with_collectors(tmp.path())),
+            verbose: 0,
+            dry_run: false,
+            progress_every: 0,
+            max_packets: None,
+            seed: None,
+            window_seconds: Some(window),
+            attack_start: attack.map(|a| a.0),
+            attack_end: attack.map(|a| a.1),
+            min_density_ratio: 0.10,
+            min_window_packets: 0,
+            loop_fill,
+            window_anchor: anchor,
+            flow_grace_seconds: 5.0,
+        })?;
+        let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
+        let mut cap = Capture::from_file(tmp.path().join("out.pcap"))?;
+        let mut ts = Vec::new();
+        while let Ok(p) = cap.next_packet() {
+            ts.push(p.header.ts.tv_sec as i64 * 1_000_000 + p.header.ts.tv_usec as i64);
+        }
+        Ok((m, ts))
+    }
+
+    /// A long flow (port 1111, one packet per second from t=0 to 99) begins before the window;
+    /// a short flow (port 2222, 3 packets) begins inside every window the attack span allows.
+    fn long_and_short() -> Vec<(u32, u32, u16)> {
+        let mut v: Vec<(u32, u32, u16)> = (0..100).map(|t| (1_000 + t, 0, 1111)).collect();
+        v.extend([
+            (1_060, 200_000, 2222),
+            (1_060, 400_000, 2222),
+            (1_061, 0, 2222),
+        ]);
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn flow_start_anchor_keeps_only_flows_that_begin_inside_the_window()
+    -> Result<(), Box<dyn Error>> {
+        let pkts = long_and_short();
+        let (m, ts) = run_flows(
+            &pkts,
+            10.0,
+            Some((60.0, 60.5)),
+            WindowAnchor::FlowStart,
+            false,
+        )?;
+        assert_eq!(m["stats"]["window_anchor"], "flow_start");
+        assert_eq!(m["stats"]["flows_kept"], 1);
+        assert_eq!(m["stats"]["flows_dropped_partial"], 1);
+        assert!(m["stats"]["packets_dropped_partial"].as_u64().unwrap() > 0);
+        // only the short flow's three packets survive
+        assert_eq!(ts.len(), 3, "kept {ts:?}");
+        // time anchoring keeps the long flow's packets too
+        let (mt, tt) = run_flows(&pkts, 10.0, Some((60.0, 60.5)), WindowAnchor::Time, false)?;
+        assert_eq!(mt["stats"]["window_anchor"], "time");
+        assert!(tt.len() > 3);
+        assert_eq!(mt["stats"]["flows_dropped_partial"], 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_zero_span_capture_loops_with_increasing_pass_starts() -> Result<(), Box<dyn Error>> {
+        let pkts = [(1_000, 0, 1111), (1_000, 0, 1111), (1_000, 0, 1111)];
+        let (m, ts) = run_flows(&pkts, 30.0, None, WindowAnchor::FlowStart, true)?;
+        let passes = m["stats"]["loop_passes"].as_u64().unwrap();
+        assert!(passes > 1, "passes {passes}");
+        let starts: Vec<i64> = ts.chunks(3).map(|c| c[0]).collect();
+        assert!(starts.windows(2).all(|w| w[1] > w[0]), "starts {starts:?}");
+        let span = m["stats"]["output_span_seconds"].as_f64().unwrap();
+        assert!(span >= 30.0, "span {span}");
         Ok(())
     }
 }
