@@ -362,13 +362,15 @@ fn emit_loop_passes(
     target_span: f64,
 ) -> Result<(u64, Option<f64>), Box<dyn Error>> {
     const MAX_PASSES: u64 = 1000;
-    let t0 = header_micros(&buf[0].0);
-    let t_last = header_micros(&buf[buf.len() - 1].0);
-    let pass_span = (t_last - t0).max(0);
-    let mut gaps: Vec<i64> = buf
-        .windows(2)
-        .map(|w| (header_micros(&w[1].0) - header_micros(&w[0].0)).max(0))
-        .collect();
+    // Timestamps need not be monotonic in file order (shuffled captures): the pass extent
+    // is its min..max, not first..last record, or a pass whose last record is earlier than
+    // its first would get span 0 and the loop would never reach the window.
+    let mut sorted: Vec<i64> = buf.iter().map(|(h, _)| header_micros(h)).collect();
+    sorted.sort_unstable();
+    let t0 = sorted[0];
+    let t_last = sorted[sorted.len() - 1];
+    let pass_span = t_last - t0;
+    let mut gaps: Vec<i64> = sorted.windows(2).map(|w| w[1] - w[0]).collect();
     gaps.sort_unstable();
     let median_gap = if gaps.is_empty() {
         0
@@ -1635,6 +1637,7 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
     let mut loop_buffering = loop_enabled;
     let mut loop_passes = 1_u64;
     let mut last_out_timestamp: Option<f64> = None;
+    let mut first_out_timestamp: Option<f64> = None;
     let mut packets_outside_window = 0_u64;
 
     let mut packets_total = 0_u64;
@@ -1687,7 +1690,11 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 }
                 first_timestamp.get_or_insert(timestamp);
                 last_timestamp = Some(timestamp);
-                last_out_timestamp = Some(timestamp);
+                // Min/max, not first/last record: input timestamps may be unsorted.
+                last_out_timestamp =
+                    Some(last_out_timestamp.map_or(timestamp, |l| l.max(timestamp)));
+                first_out_timestamp =
+                    Some(first_out_timestamp.map_or(timestamp, |f| f.min(timestamp)));
                 // Reusable frame buffers: no per-packet heap allocation.
                 data.clear();
                 data.extend_from_slice(packet.data);
@@ -1815,7 +1822,7 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
         let (passes, last_ts) = emit_loop_passes(&mut writer, &loop_buf, target_span)?;
         loop_passes = passes;
         if let Some(t) = last_ts {
-            last_out_timestamp = Some(t);
+            last_out_timestamp = Some(last_out_timestamp.map_or(t, |l| l.max(t)));
         }
     }
 
@@ -1848,7 +1855,7 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
             window_packets: window_sel.as_ref().map(|s| s.window_packets),
             window_rule: window_sel.as_ref().map(|s| s.rule.clone()),
             loop_passes,
-            output_span_seconds: first_timestamp
+            output_span_seconds: first_out_timestamp
                 .zip(last_out_timestamp)
                 .map(|(first, last)| (last - first).max(0.0)),
             window_anchor: window_sel
@@ -2974,6 +2981,21 @@ mod tests {
         );
         assert!(!ts.is_empty(), "output empty");
         assert!(m["stats"]["flows_kept"].as_u64().unwrap() >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unsorted_pass_loops_to_fill_the_window_without_hitting_the_cap()
+    -> Result<(), Box<dyn Error>> {
+        // Last record earlier than the first (shuffled capture): file-order span is
+        // negative; the loop must use the min..max extent (T032).
+        let mut pkts = vec![(1_029, 0, 1111)];
+        pkts.extend(std::iter::repeat_n((1_000, 0, 1111), 1_099));
+        let (m, _ts) = run_flows(&pkts, 30.0, None, WindowAnchor::FlowStart, true)?;
+        let passes = m["stats"]["loop_passes"].as_u64().unwrap();
+        assert!(passes > 1 && passes < 1000, "passes {passes}");
+        let span = m["stats"]["output_span_seconds"].as_f64().unwrap();
+        assert!(span >= 30.0, "span {span}");
         Ok(())
     }
 
