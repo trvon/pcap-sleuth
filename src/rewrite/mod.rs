@@ -271,6 +271,10 @@ struct RewriteStats {
     flows_dropped_partial: u64,
     /// Packets of those flows that fell inside the window's time range.
     packets_dropped_partial: u64,
+    /// True when the input's timestamps were not in order (measured only when windowing).
+    input_unsorted: bool,
+    /// Records whose timestamp is earlier than the record before them (windowing only).
+    input_out_of_order_packets: u64,
 }
 
 /// Bidirectional flow key: protocol plus the unordered pair of (address, port) endpoints.
@@ -1483,6 +1487,50 @@ pub fn run(cli: RewriteCli) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Removes the timestamp-sorted temporary capture when dropped.
+struct SortedTemp(PathBuf);
+
+impl Drop for SortedTemp {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn record_micros(h: &pcap::PacketHeader) -> i64 {
+    h.ts.tv_sec as i64 * 1_000_000 + h.ts.tv_usec as i64
+}
+
+/// Count records that are earlier than their predecessor. When there are any, write the
+/// capture to `tmp` in timestamp order (stable: ties keep file order) and return the count.
+fn sort_capture_by_time(
+    input: &Path,
+    linktype: Linktype,
+    tmp: &Path,
+) -> Result<u64, Box<dyn Error>> {
+    let mut cap = Capture::from_file(input)?;
+    let mut records: Vec<(pcap::PacketHeader, Vec<u8>)> = Vec::new();
+    let mut out_of_order = 0_u64;
+    let mut prev: Option<i64> = None;
+    while let Ok(p) = cap.next_packet() {
+        let t = record_micros(p.header);
+        if prev.is_some_and(|q| t < q) {
+            out_of_order += 1;
+        }
+        prev = Some(t);
+        records.push((*p.header, p.data.to_vec()));
+    }
+    if out_of_order == 0 {
+        return Ok(0);
+    }
+    records.sort_by_key(|(h, _)| record_micros(h));
+    let mut writer = PcapWriter::create(tmp, linktype)?;
+    for (h, d) in &records {
+        writer.write(h, d)?;
+    }
+    writer.finish()?;
+    Ok(out_of_order)
+}
+
 fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Error>> {
     if !config.input.exists() {
         return Err(format!("Input capture not found: {}", config.input.display()).into());
@@ -1554,6 +1602,8 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 flows_kept: 0,
                 flows_dropped_partial: 0,
                 packets_dropped_partial: 0,
+                input_unsorted: false,
+                input_out_of_order_packets: 0,
                 window_seconds: None,
                 window_start_seconds: None,
                 source_duration_seconds: None,
@@ -1586,15 +1636,37 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
     }
     let mut writer = PcapWriter::create(&config.output, output_linktype)?;
 
+    // Windowing reads timestamps in order: an unsorted capture is sorted into a temporary
+    // file next to the output, and every later read uses that file.
+    let mut input_out_of_order_packets = 0_u64;
+    let mut sorted_guard: Option<SortedTemp> = None;
+    if config.window_seconds.is_some() {
+        let mut tmp_name = config.output.as_os_str().to_owned();
+        tmp_name.push(".sorted.tmp");
+        let tmp = PathBuf::from(tmp_name);
+        let n = sort_capture_by_time(&config.input, input_linktype, &tmp);
+        let guard = SortedTemp(tmp);
+        input_out_of_order_packets = n?;
+        if input_out_of_order_packets > 0 {
+            capture = Capture::from_file(&guard.0)?;
+            sorted_guard = Some(guard);
+        }
+    }
+    let input_unsorted = input_out_of_order_packets > 0;
+    let src_path: PathBuf = sorted_guard
+        .as_ref()
+        .map(|g| g.0.clone())
+        .unwrap_or_else(|| config.input.clone());
+
     let profile = match config.window_seconds {
-        Some(_) => profile_capture_density(&config.input)?,
+        Some(_) => profile_capture_density(&src_path)?,
         None => None,
     };
     let flow_first = if config.window_seconds.is_some()
         && profile.is_some()
         && config.window_anchor == WindowAnchor::FlowStart
     {
-        Some(flow_first_seen(&config.input)?)
+        Some(flow_first_seen(&src_path)?)
     } else {
         None
     };
@@ -1864,6 +1936,8 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
             flows_kept: kept_flows.len() as u64,
             flows_dropped_partial: dropped_flows.len() as u64,
             packets_dropped_partial,
+            input_unsorted,
+            input_out_of_order_packets,
         },
         warnings,
     };
@@ -3009,6 +3083,38 @@ mod tests {
         assert!(starts.windows(2).all(|w| w[1] > w[0]), "starts {starts:?}");
         let span = m["stats"]["output_span_seconds"].as_f64().unwrap();
         assert!(span >= 30.0, "span {span}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unsorted_capture_is_windowed_on_its_sorted_form() -> Result<(), Box<dyn Error>> {
+        // 60 records over 20 s in order, then reversed in file order: the sorted form
+        // fits a 30 s window, the file order does not.
+        let mut times: Vec<(u32, u32)> = (0..60)
+            .map(|i| (1_000 + i / 3, (i % 3) * 100_000))
+            .collect();
+        times.reverse();
+        let (m, _ts) = windowed_at(&times, 30.0, 1, true)?;
+        assert_eq!(m["stats"]["input_unsorted"], true);
+        assert!(m["stats"]["input_out_of_order_packets"].as_u64().unwrap() > 0);
+        let span = m["stats"]["output_span_seconds"].as_f64().unwrap();
+        // W + flow grace + one loop shift (one pass extent, ~20 s here).
+        assert!(span <= 30.0 + 5.0 + 20.5, "span {span}");
+        assert!(m["stats"]["loop_passes"].as_u64().unwrap() < 10);
+        Ok(())
+    }
+
+    #[test]
+    fn a_sorted_capture_is_not_resorted_and_keeps_its_order() -> Result<(), Box<dyn Error>> {
+        let times: Vec<(u32, u32)> = (0..20).map(|i| (1_000 + i, 0)).collect();
+        let (m, ts) = windowed_at(&times, 60.0, 1, false)?;
+        assert_eq!(m["stats"]["input_unsorted"], false);
+        assert_eq!(m["stats"]["input_out_of_order_packets"], 0);
+        let want: Vec<i64> = times
+            .iter()
+            .map(|(s, u)| *s as i64 * 1_000_000 + *u as i64)
+            .collect();
+        assert_eq!(ts, want);
         Ok(())
     }
 }
