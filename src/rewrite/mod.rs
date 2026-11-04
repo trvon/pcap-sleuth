@@ -96,6 +96,11 @@ pub struct RewriteCli {
     #[arg(long, value_name = "BOOL", default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     pub loop_fill: bool,
 
+    /// Cap on loop-fill passes (default 1000). When the cap, not the window, stops the loop the
+    /// output is shorter than --window-seconds and the manifest sets loop_capped.
+    #[arg(long, value_name = "N", default_value_t = 1000)]
+    pub max_loop_passes: u64,
+
     /// How a window selects packets. `flow-start` (default) keeps only packets of flows whose
     /// first packet in the capture lies inside the window (so handshakes are present);
     /// `time` keeps every packet whose timestamp lies inside the window.
@@ -146,6 +151,7 @@ pub struct RewriteConfig {
     pub min_density_ratio: f64,
     pub min_window_packets: u64,
     pub loop_fill: bool,
+    pub max_loop_passes: u64,
     pub window_anchor: WindowAnchor,
     pub flow_grace_seconds: f64,
     pub max_window_span: Option<f64>,
@@ -173,6 +179,7 @@ impl RewriteConfig {
             min_density_ratio: cli.min_density_ratio,
             min_window_packets: cli.min_window_packets,
             loop_fill: cli.loop_fill,
+            max_loop_passes: cli.max_loop_passes,
             window_anchor: cli.window_anchor,
             flow_grace_seconds: cli.flow_grace_seconds,
             max_window_span: cli.max_window_span,
@@ -269,6 +276,10 @@ struct RewriteStats {
     window_rule: Option<String>,
     /// Passes of the window emitted (1 = no looping).
     loop_passes: u64,
+    /// Configured cap on loop passes.
+    max_loop_passes: u64,
+    /// True when the loop stopped because of the cap, not because the window was filled.
+    loop_capped: bool,
     /// Packets of the final loop pass dropped because they fell at or after the window end.
     loop_truncated_packets: u64,
     /// Span (first to last packet) of the emitted output, seconds.
@@ -376,8 +387,8 @@ fn emit_loop_passes(
     writer: &mut PcapWriter,
     buf: &[(pcap::PacketHeader, Vec<u8>)],
     target_span: f64,
-) -> Result<(u64, Option<f64>, u64), Box<dyn Error>> {
-    const MAX_PASSES: u64 = 1000;
+    max_passes: u64,
+) -> Result<(u64, Option<f64>, u64, bool), Box<dyn Error>> {
     // Timestamps need not be monotonic in file order (shuffled captures): the pass extent
     // is its min..max, not first..last record, or a pass whose last record is earlier than
     // its first would get span 0 and the loop would never reach the window.
@@ -405,10 +416,10 @@ fn emit_loop_passes(
     // A first pass that already fills the window up to one packet gap (the window is
     // half-open, so a dense capture ends one gap short of window_seconds) is not looped.
     if pass_span + median_gap >= target_us {
-        return Ok((1, None, 0));
+        return Ok((1, None, 0, false));
     }
     let mut truncated = 0_u64;
-    while passes < MAX_PASSES && (passes as i64) * shift < target_us {
+    while passes < max_passes.max(1) && (passes as i64) * shift < target_us {
         let offset = (passes as i64) * shift;
         for (h, d) in buf {
             let mut nh = *h;
@@ -424,7 +435,8 @@ fn emit_loop_passes(
         }
         passes += 1;
     }
-    Ok((passes, Some(last as f64 / 1_000_000.0), truncated))
+    let capped = (passes as i64) * shift < target_us;
+    Ok((passes, Some(last as f64 / 1_000_000.0), truncated, capped))
 }
 
 #[derive(Debug, Default)]
@@ -1696,6 +1708,8 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 window_packets: None,
                 window_rule: None,
                 loop_passes: 1,
+                max_loop_passes: config.max_loop_passes,
+                loop_capped: false,
                 loop_truncated_packets: 0,
                 output_span_seconds: None,
             },
@@ -1797,6 +1811,7 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
     let mut loop_buf: Vec<(pcap::PacketHeader, Vec<u8>)> = Vec::new();
     let mut loop_buffering = loop_enabled;
     let mut loop_passes = 1_u64;
+    let mut loop_capped = false;
     let mut loop_truncated_packets = 0_u64;
     let mut last_out_timestamp: Option<f64> = None;
     let mut first_out_timestamp: Option<f64> = None;
@@ -1981,8 +1996,10 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
     }
 
     if loop_buffering && !loop_buf.is_empty() {
-        let (passes, last_ts, truncated) = emit_loop_passes(&mut writer, &loop_buf, target_span)?;
+        let (passes, last_ts, truncated, capped) =
+            emit_loop_passes(&mut writer, &loop_buf, target_span, config.max_loop_passes)?;
         loop_passes = passes;
+        loop_capped = capped;
         loop_truncated_packets = truncated;
         if let Some(t) = last_ts {
             last_out_timestamp = Some(last_out_timestamp.map_or(t, |l| l.max(t)));
@@ -2018,6 +2035,8 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
             window_packets: window_sel.as_ref().map(|s| s.window_packets),
             window_rule: window_sel.as_ref().map(|s| s.rule.clone()),
             loop_passes,
+            max_loop_passes: config.max_loop_passes,
+            loop_capped,
             loop_truncated_packets,
             output_span_seconds: first_out_timestamp
                 .zip(last_out_timestamp)
@@ -2227,6 +2246,7 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill: false,
+            max_loop_passes: 1000,
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
@@ -2266,6 +2286,7 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill: false,
+            max_loop_passes: 1000,
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
@@ -2324,6 +2345,7 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill: false,
+            max_loop_passes: 1000,
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
@@ -2369,6 +2391,7 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill: false,
+            max_loop_passes: 1000,
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
@@ -2727,6 +2750,7 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill: false,
+            max_loop_passes: 1000,
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
@@ -2781,6 +2805,7 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill: false,
+            max_loop_passes: 1000,
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
@@ -2869,6 +2894,7 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill: false,
+            max_loop_passes: 1000,
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
@@ -2904,6 +2930,7 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill: false,
+            max_loop_passes: 1000,
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
@@ -2940,6 +2967,16 @@ mod tests {
         min_packets: u64,
         loop_fill: bool,
     ) -> Result<(serde_json::Value, Vec<i64>), Box<dyn Error>> {
+        windowed_capped(times, window, min_packets, loop_fill, 1000)
+    }
+
+    fn windowed_capped(
+        times: &[(u32, u32)],
+        window: f64,
+        min_packets: u64,
+        loop_fill: bool,
+        max_loop_passes: u64,
+    ) -> Result<(serde_json::Value, Vec<i64>), Box<dyn Error>> {
         let tmp = tempdir()?;
         let input = tmp.path().join("in.pcap");
         fs::write(&input, pcap_at(times)?)?;
@@ -2960,6 +2997,7 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: min_packets,
             loop_fill,
+            max_loop_passes,
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
@@ -2993,6 +3031,25 @@ mod tests {
         let (off, ts_off) = windowed_at(&times, 30.0, 0, false)?;
         assert_eq!(off["stats"]["loop_passes"], 1);
         assert_eq!(ts_off.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn the_loop_pass_cap_stops_the_loop_before_the_window() -> Result<(), Box<dyn Error>> {
+        // 20 packets 1 ms apart: pass shift = max(0.02 s, 30 s / 20 = 1.5 s) -> 20 passes fill 30 s
+        let times: Vec<(u32, u32)> = (0..20).map(|i| (1_000, i * 1_000)).collect();
+        let (m, ts) = windowed_capped(&times, 30.0, 0, true, 3)?;
+        assert_eq!(m["stats"]["loop_passes"], 3);
+        assert_eq!(m["stats"]["max_loop_passes"], 3);
+        assert_eq!(m["stats"]["loop_capped"], true);
+        assert_eq!(ts.len(), 60);
+        let span = m["stats"]["output_span_seconds"].as_f64().unwrap();
+        assert!(span < 30.0, "span {span}");
+        // default cap: the window stops the loop (same passes as the uncapped code), not the cap
+        let (d, _) = windowed_at(&times, 30.0, 0, true)?;
+        assert_eq!(d["stats"]["max_loop_passes"], 1000);
+        assert_eq!(d["stats"]["loop_capped"], false);
+        assert_eq!(d["stats"]["loop_passes"], 20);
         Ok(())
     }
 
@@ -3074,6 +3131,7 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: 0,
             loop_fill,
+            max_loop_passes: 1000,
             window_anchor: anchor,
             flow_grace_seconds: 5.0,
             max_window_span: None,
@@ -3255,6 +3313,7 @@ mod tests {
             min_density_ratio: 0.10,
             min_window_packets: min_packets,
             loop_fill: true,
+            max_loop_passes: 1000,
             window_anchor: WindowAnchor::FlowStart,
             flow_grace_seconds: 5.0,
             max_window_span: None,
