@@ -245,6 +245,9 @@ pub fn clamp_record_len(header: &mut pcap::PacketHeader) -> bool {
 #[derive(Debug, Serialize, Clone, Default)]
 struct RewriteStats {
     packets_total: u64,
+    /// Records in the output file (window, partial-flow drops and loop-fill applied).
+    /// `packets_total` counts the input; a windowed replay sends this many.
+    packets_written: u64,
     packets_converted: u64,
     packets_remapped: u64,
     packets_ipv6_converted: u64,
@@ -474,6 +477,8 @@ const WRITE_BUFFER_COUNT: usize = 3;
 /// the 65535 that `Capture::dead` installs, and record headers carry the 32-bit
 /// truncation of the timestamp that `pcap_dump` performs.
 struct PcapWriter {
+    /// Records written so far: the replayed file's packet count, loop-fill included.
+    written: u64,
     buf: Vec<u8>,
     full: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
     recycled: std::sync::mpsc::Receiver<Vec<u8>>,
@@ -514,6 +519,7 @@ impl PcapWriter {
             })?;
 
         Ok(Self {
+            written: 0,
             buf: Vec::with_capacity(WRITE_BUFFER_BYTES),
             full: Some(full_tx),
             recycled: recycle_rx,
@@ -523,6 +529,7 @@ impl PcapWriter {
 
     #[inline]
     fn write(&mut self, header: &pcap::PacketHeader, data: &[u8]) -> Result<(), std::io::Error> {
+        self.written += 1;
         let mut record = [0u8; 16];
         record[0..4].copy_from_slice(&(header.ts.tv_sec as u32).to_ne_bytes());
         record[4..8].copy_from_slice(&(header.ts.tv_usec as u32).to_ne_bytes());
@@ -1681,6 +1688,7 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
         return Ok(RewriteOutcome {
             stats: RewriteStats {
                 packets_total,
+                packets_written: 0, // dry run writes nothing
                 packets_converted: 0,
                 packets_remapped: 0,
                 packets_ipv6_converted: 0,
@@ -2006,11 +2014,13 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
         }
     }
 
+    let packets_written = writer.written;
     writer.finish()?;
 
     let mut outcome = RewriteOutcome {
         stats: RewriteStats {
             packets_total,
+            packets_written,
             packets_converted,
             packets_remapped,
             packets_ipv6_converted,
@@ -3043,6 +3053,9 @@ mod tests {
         assert_eq!(m["stats"]["max_loop_passes"], 3);
         assert_eq!(m["stats"]["loop_capped"], true);
         assert_eq!(ts.len(), 60);
+        // the replayed count is the output file's, not the input's (20)
+        assert_eq!(m["stats"]["packets_written"], 60);
+        assert_eq!(m["stats"]["packets_total"], 20);
         let span = m["stats"]["output_span_seconds"].as_f64().unwrap();
         assert!(span < 30.0, "span {span}");
         // default cap: the window stops the loop (same passes as the uncapped code), not the cap
