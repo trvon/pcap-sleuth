@@ -20,6 +20,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+mod segment;
+
 /// CLI arguments for the experimental `rewrite` command.
 #[derive(Parser, Debug)]
 #[command(
@@ -117,6 +119,13 @@ pub struct RewriteCli {
     /// densest --window-seconds window, which loop-fill repeats (window_rule `densest_loop`).
     #[arg(long, value_name = "SECONDS")]
     pub max_window_span: Option<f64>,
+
+    /// Largest frame the replay link carries (bytes, Ethernet header included; default 1514,
+    /// a 1500-byte MTU). Larger frames, coalesced by the capturing host's offload, are split
+    /// into what the wire carried: IPv4/TCP re-segmented at the MSS, other IPv4 fragmented.
+    /// 0 disables splitting.
+    #[arg(long, value_name = "BYTES", default_value_t = 1514)]
+    pub max_frame_bytes: usize,
 }
 
 /// Window packet-selection rule.
@@ -155,6 +164,7 @@ pub struct RewriteConfig {
     pub window_anchor: WindowAnchor,
     pub flow_grace_seconds: f64,
     pub max_window_span: Option<f64>,
+    pub max_frame_bytes: usize,
 }
 
 impl RewriteConfig {
@@ -183,6 +193,7 @@ impl RewriteConfig {
             window_anchor: cli.window_anchor,
             flow_grace_seconds: cli.flow_grace_seconds,
             max_window_span: cli.max_window_span,
+            max_frame_bytes: cli.max_frame_bytes,
         }
     }
 }
@@ -255,6 +266,17 @@ struct RewriteStats {
     /// caplen so gopherCap (which rejects the whole file on the first such
     /// record after scanning all of it) accepts the output.
     packets_len_clamped: u64,
+    /// Link frame limit in force (bytes; 0 = splitting disabled).
+    max_frame_bytes: usize,
+    /// Input frames over the limit re-segmented as TCP (TSO-style).
+    packets_resegmented: u64,
+    /// Input frames over the limit fragmented as IPv4 (non-TCP).
+    packets_fragmented: u64,
+    /// Output records those frames became (replacing them one for many).
+    split_records_emitted: u64,
+    /// Frames over the limit that could not be split (non-IPv4 or malformed); written
+    /// unchanged, so the injector will fail to send them.
+    packets_oversize_unsplit: u64,
     capture_duration_seconds: Option<f64>,
     input_format: String,
     output_format: String,
@@ -1693,6 +1715,11 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 packets_remapped: 0,
                 packets_ipv6_converted: 0,
                 packets_len_clamped: 0,
+                max_frame_bytes: config.max_frame_bytes,
+                packets_resegmented: 0,
+                packets_fragmented: 0,
+                split_records_emitted: 0,
+                packets_oversize_unsplit: 0,
                 capture_duration_seconds: first_timestamp
                     .zip(last_timestamp)
                     .map(|(first, last)| (last - first).max(0.0)),
@@ -1830,6 +1857,10 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
     let mut packets_remapped = 0_u64;
     let mut packets_ipv6_converted = 0_u64;
     let mut packets_len_clamped = 0_u64;
+    let mut packets_resegmented = 0_u64;
+    let mut packets_fragmented = 0_u64;
+    let mut split_records_emitted = 0_u64;
+    let mut packets_oversize_unsplit = 0_u64;
     let mut first_timestamp: Option<f64> = None;
     let mut last_timestamp: Option<f64> = None;
     let mut warnings = Vec::new();
@@ -1937,13 +1968,44 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
                 if clamp_record_len(&mut header) {
                     packets_len_clamped += 1;
                 }
-                writer.write(&header, &data)?;
-                if loop_buffering {
-                    if timestamp - first_timestamp.unwrap_or(timestamp) >= target_span {
-                        loop_buffering = false;
-                        loop_buf = Vec::new();
-                    } else {
-                        loop_buf.push((header, data.clone()));
+                // Frames over the link limit are replaced by the segments the wire carried.
+                let parts = match segment::split_oversized(&data, config.max_frame_bytes) {
+                    segment::Segmented::Fits => None,
+                    segment::Segmented::Tcp(p) => {
+                        packets_resegmented += 1;
+                        Some(p)
+                    }
+                    segment::Segmented::Fragmented(p) => {
+                        packets_fragmented += 1;
+                        Some(p)
+                    }
+                    segment::Segmented::Unsendable => {
+                        packets_oversize_unsplit += 1;
+                        None
+                    }
+                };
+                if loop_buffering && timestamp - first_timestamp.unwrap_or(timestamp) >= target_span {
+                    loop_buffering = false;
+                    loop_buf = Vec::new();
+                }
+                match parts {
+                    None => {
+                        writer.write(&header, &data)?;
+                        if loop_buffering {
+                            loop_buf.push((header, data.clone()));
+                        }
+                    }
+                    Some(parts) => {
+                        split_records_emitted += parts.len() as u64;
+                        for part in parts {
+                            let mut h = header;
+                            h.caplen = part.len() as u32;
+                            h.len = part.len() as u32;
+                            writer.write(&h, &part)?;
+                            if loop_buffering {
+                                loop_buf.push((h, part));
+                            }
+                        }
                     }
                 }
 
@@ -2025,6 +2087,11 @@ fn perform_rewrite(config: &RewriteConfig) -> Result<RewriteOutcome, Box<dyn Err
             packets_remapped,
             packets_ipv6_converted,
             packets_len_clamped,
+            max_frame_bytes: config.max_frame_bytes,
+            packets_resegmented,
+            packets_fragmented,
+            split_records_emitted,
+            packets_oversize_unsplit,
             capture_duration_seconds: first_timestamp
                 .zip(last_timestamp)
                 .map(|(first, last)| (last - first).max(0.0)),
@@ -2260,6 +2327,7 @@ mod tests {
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
+            max_frame_bytes: 1514,
         };
 
         run(cli)?;
@@ -2300,6 +2368,7 @@ mod tests {
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
+            max_frame_bytes: 1514,
         };
 
         run(cli)?;
@@ -2359,6 +2428,7 @@ mod tests {
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
+            max_frame_bytes: 1514,
         };
         run(cli)?;
         let output = tmp.path().join("badlen_rewritten.pcap");
@@ -2405,6 +2475,7 @@ mod tests {
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
+            max_frame_bytes: 1514,
         };
 
         run(cli)?;
@@ -2764,6 +2835,7 @@ mod tests {
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
+            max_frame_bytes: 1514,
         };
         run(cli)?;
         let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
@@ -2819,6 +2891,7 @@ mod tests {
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
+            max_frame_bytes: 1514,
         })?;
         let mut m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
         let mut cap = Capture::from_file(tmp.path().join("out.pcap"))?;
@@ -2908,6 +2981,7 @@ mod tests {
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
+            max_frame_bytes: 1514,
         })?;
         let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
         let kept = m["stats"]["window_packets"].as_u64().unwrap();
@@ -2944,6 +3018,7 @@ mod tests {
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
+            max_frame_bytes: 1514,
         })?;
         let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
         let start = m["stats"]["window_start_seconds"].as_f64().unwrap();
@@ -3011,6 +3086,7 @@ mod tests {
             window_anchor: WindowAnchor::Time,
             flow_grace_seconds: 5.0,
             max_window_span: None,
+            max_frame_bytes: 1514,
         })?;
         let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
         let mut cap = Capture::from_file(tmp.path().join("out.pcap"))?;
@@ -3148,6 +3224,7 @@ mod tests {
             window_anchor: anchor,
             flow_grace_seconds: 5.0,
             max_window_span: None,
+            max_frame_bytes: 1514,
         })?;
         let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
         let mut cap = Capture::from_file(tmp.path().join("out.pcap"))?;
@@ -3330,6 +3407,7 @@ mod tests {
             window_anchor: WindowAnchor::FlowStart,
             flow_grace_seconds: 5.0,
             max_window_span: None,
+            max_frame_bytes: 1514,
         })?;
         let m: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
         let mut cap = Capture::from_file(tmp.path().join("out.pcap"))?;
